@@ -654,10 +654,23 @@ def _make_unvirtualized_stage_dir(prefix: str = "stage-") -> Path:
     Keeping staging under ``~/.hermes/icon-replacer/tmp`` avoids Windows Store
     AppData/Temp virtualization (``wcifs.sys``) so elevated native processes
     see the exact same files written by Store Python.
+
+    IMPORTANT: Uses ``Path.mkdir()`` rather than ``tempfile.mkdtemp()`` because
+    CPython 3.13+ ``os.mkdir(path, 0o700)`` on Windows applies a protected
+    non-inheriting DACL (SYSTEM, Administrators, OWNER RIGHTS), which blocks
+    non-elevated Store Python from reading files created inside the directory
+    by an elevated PowerShell child process.
     """
     tmp_root = REPLACER_ROOT / "tmp"
     tmp_root.mkdir(parents=True, exist_ok=True)
-    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(tmp_root)))
+    for attempt in range(32):
+        candidate = tmp_root / f"{prefix}{os.getpid()}-{int(time.time() * 1000)}-{attempt}"
+        if not candidate.exists():
+            candidate.mkdir(parents=True, exist_ok=True)
+            return candidate
+    fallback = tmp_root / f"{prefix}{os.getpid()}-{os.urandom(4).hex()}"
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback
 
 
 def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
@@ -706,28 +719,42 @@ def _build_windows_acl_ps_script(
     lines = [
         "$ErrorActionPreference = 'Continue'",
         f"$errLog = {_ps_quote(err_log_path)}",
+        f"$appDir = {_ps_quote(win_app_dir)}",
         "try {",
+        "  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {",
+        "    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase) -and $_.Name -notlike 'python*'",
+        "  } | ForEach-Object {",
+        "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+        "  }",
+        "  $dirGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)F', '*S-1-15-2-1:(OI)(CI)RX', '*S-1-15-2-2:(OI)(CI)RX')",
+        "  $fileGrants = @('*S-1-5-32-544:F', '*S-1-5-32-545:F', '*S-1-15-2-1:RX', '*S-1-15-2-2:RX')",
         f"  $recDirs = @({rec_arr})",
         "  foreach ($d in $recDirs) {",
         "    if ($d -and (Test-Path -LiteralPath $d)) {",
         "      & takeown.exe /F $d /A /R /D Y 2>$null | Out-Null",
-        "      & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q 2>$null | Out-Null",
-        "      Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R $_.FullName 2>$null | Out-Null }",
+        "      foreach ($g in $dirGrants) {",
+        "        & icacls.exe $d /grant $g /T /C /Q 2>$null | Out-Null",
+        "      }",
+        "      Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R -S -H $_.FullName 2>$null | Out-Null }",
         "    }",
         "  }",
         f"  $dirs = @({dir_arr})",
         "  foreach ($d in $dirs) {",
         "    if ($d -and (Test-Path -LiteralPath $d)) {",
         "      & takeown.exe /F $d /A 2>$null | Out-Null",
-        "      & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /C /Q 2>$null | Out-Null",
+        "      foreach ($g in $dirGrants) {",
+        "        & icacls.exe $d /grant $g /C /Q 2>$null | Out-Null",
+        "      }",
         "    }",
         "  }",
         f"  $files = @({file_arr})",
         "  foreach ($f in $files) {",
         "    if ($f -and (Test-Path -LiteralPath $f)) {",
         "      & takeown.exe /F $f /A 2>$null | Out-Null",
-        "      & icacls.exe $f /grant '*S-1-5-32-545:F' /grant '*S-1-5-32-544:F' /grant '*S-1-15-2-1:RX' /grant '*S-1-15-2-2:RX' /C /Q 2>$null | Out-Null",
-        "      & attrib.exe -R $f 2>$null | Out-Null",
+        "      foreach ($g in $fileGrants) {",
+        "        & icacls.exe $f /grant $g /C /Q 2>$null | Out-Null",
+        "      }",
+        "      & attrib.exe -R -S -H $f 2>$null | Out-Null",
         "    }",
         "  }",
     ]
@@ -735,24 +762,39 @@ def _build_windows_acl_ps_script(
         lines.extend(
             [
                 f"  $copies = @({copy_entries})",
+                "  $copyErrors = @()",
                 "  foreach ($c in $copies) {",
                 "    if (Test-Path -LiteralPath $c.Src) {",
-                "      $parent = Split-Path -Parent $c.Dst",
-                "      if ($parent -and -not (Test-Path -LiteralPath $parent)) {",
-                "        New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null",
-                "      }",
-                "      if (Test-Path -LiteralPath $c.Dst) {",
-                "        & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
-                "        Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
-                "        if (Test-Path -LiteralPath $c.Dst) {",
-                "          $old = \"$($c.Dst).old\"",
-                "          Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
-                "          Move-Item -LiteralPath $c.Dst -Destination $old -Force -ErrorAction SilentlyContinue",
-                "          Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
+                "      try {",
+                "        $parent = Split-Path -Parent $c.Dst",
+                "        if ($parent -and -not (Test-Path -LiteralPath $parent)) {",
+                "          New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null",
                 "        }",
+                "        if (Test-Path -LiteralPath $c.Dst) {",
+                "          & takeown.exe /F $c.Dst /A 2>$null | Out-Null",
+                "          foreach ($g in $fileGrants) {",
+                "            & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
+                "          }",
+                "          & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
+                "          Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
+                "          if (Test-Path -LiteralPath $c.Dst) {",
+                "            $old = \"$($c.Dst).old\"",
+                "            Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
+                "            Move-Item -LiteralPath $c.Dst -Destination $old -Force -ErrorAction SilentlyContinue",
+                "            Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
+                "          }",
+                "        }",
+                "        Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
+                "        foreach ($g in $fileGrants) {",
+                "          & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
+                "        }",
+                "      } catch {",
+                "        $copyErrors += \"$($c.Dst): $($_.Exception.Message)\"",
                 "      }",
-                "      Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
                 "    }",
+                "  }",
+                "  if ($copyErrors.Count -gt 0) {",
+                "    throw ($copyErrors -join \"`n\")",
                 "  }",
             ]
         )
@@ -760,6 +802,9 @@ def _build_windows_acl_ps_script(
         [
             "} catch {",
             "  ($_ | Out-String) | Set-Content -LiteralPath $errLog -Encoding UTF8",
+            "  & icacls.exe $errLog /grant '*S-1-5-32-545:F' /C /Q 2>$null | Out-Null",
+            "  & icacls.exe $errLog /grant '*S-1-15-2-1:R' /C /Q 2>$null | Out-Null",
+            "  & icacls.exe $errLog /grant '*S-1-15-2-2:R' /C /Q 2>$null | Out-Null",
             "  exit 1",
             "}",
         ]
@@ -786,9 +831,18 @@ def _run_windows_ps_script(
 
     try:
         ps1_path.write_text(ps_script, encoding="utf-8-sig")
-        if log_path.exists():
-            with contextlib.suppress(OSError):
-                log_path.unlink()
+        # Pre-create the error log from the non-elevated process so the calling
+        # user owns the file and retains read permissions after elevated PowerShell writes to it.
+        with contextlib.suppress(OSError):
+            log_path.write_text("", encoding="utf-8")
+
+        def _read_err_log() -> str:
+            try:
+                if log_path.is_file():
+                    return log_path.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError as exc:
+                return f"(unable to read error log {log_path}: {exc})"
+            return ""
 
         is_admin = False
         with contextlib.suppress(Exception):
@@ -805,9 +859,7 @@ def _run_windows_ps_script(
                 timeout=timeout,
             )
             if proc.returncode != 0:
-                err_detail = ""
-                if log_path.is_file():
-                    err_detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                err_detail = _read_err_log()
                 detail = err_detail or (proc.stderr or proc.stdout).strip()
                 raise RuntimeError(f"Elevated Windows ACL/copy script failed (rc={proc.returncode}): {detail}")
         else:
@@ -825,9 +877,7 @@ def _run_windows_ps_script(
                 timeout=timeout,
             )
             if proc.returncode != 0:
-                err_detail = ""
-                if log_path.is_file():
-                    err_detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                err_detail = _read_err_log()
                 detail = err_detail or (proc.stderr or proc.stdout).strip()
                 raise PermissionError(
                     "Administrator permission is required to update WindowsApps package files "

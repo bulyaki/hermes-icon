@@ -1084,11 +1084,17 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             self.assertNotIn(" /R ", file_section)
             self.assertNotIn(" /T ", file_section)
             self.assertNotIn("(OI)(CI)", file_section)
-            self.assertIn("*S-1-5-32-545:F", file_section)
+            self.assertIn("*S-1-5-32-545:F", ps_script)
             self.assertIn("attrib.exe -R", file_section)
             self.assertIn("Remove-Item", copy_section)
             self.assertIn("Move-Item", copy_section)
             self.assertIn("Copy-Item", copy_section)
+
+            # Every icacls.exe invocation must pass /grant at most once (multiple /grant on one line fails with rc=87)
+            icacls_lines = [ln.strip() for ln in ps_script.splitlines() if "icacls.exe" in ln]
+            self.assertGreaterEqual(len(icacls_lines), 5)
+            for ln in icacls_lines:
+                self.assertEqual(ln.count("/grant"), 1, f"icacls line must have exactly one /grant: {ln}")
 
             # 3. patch_windows_app_dir must stage app.asar inside REPLACER_ROOT/tmp before copying
             fake_repo = root / "staged-repo"
@@ -1117,6 +1123,11 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             try:
                 applier_mod.REPLACER_ROOT = test_replacer_root
                 applier_mod.patch_asar = _spy_patch_asar
+                # Verify _make_unvirtualized_stage_dir creates directories via Path.mkdir (not 0o700 mkdtemp)
+                probe_stage = applier_mod._make_unvirtualized_stage_dir("hermes-win-probe-")
+                self.assertTrue(probe_stage.is_dir())
+                self.assertEqual(probe_stage.parent, test_replacer_root / "tmp")
+                shutil.rmtree(probe_stage, ignore_errors=True)
                 patch_windows_app_dir(app_dir, fake_repo)
             finally:
                 applier_mod.patch_asar = orig_patch_asar

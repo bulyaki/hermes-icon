@@ -2,7 +2,7 @@
 set -eu
 
 if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
-    echo "hermes-icon 0.1.6"
+    echo "hermes-icon 0.1.7"
     exit 0
 fi
 
