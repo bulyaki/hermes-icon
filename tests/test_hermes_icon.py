@@ -48,7 +48,7 @@ from hermes_icon.config import (
     save_state,
 )
 from hermes_icon.gui import start_gui_server
-from hermes_icon.presets import PRESET_ORDER, PRESETS, VIEWBOX, build_preset_svg
+from hermes_icon.presets import PRESET_ORDER, PRESETS, VIEWBOX, build_preset_svg, resolve_preset_id
 from hermes_icon.renderer import IconRenderer, _load_generate_icons_module, apply_to_repo
 from hermes_icon.tui import LEFT_COL_WIDTH, render_tui_frame
 from hermes_icon.watcher import _launcher_bin, build_launchd_plist, git_hooks_status, is_launchd_loaded
@@ -57,8 +57,10 @@ BIN_HERMES_ICON = Path(__file__).resolve().parent.parent / "bin" / "hermes-icon"
 
 
 class TestPresetsAndValidation(unittest.TestCase):
-    def test_all_eight_presets_mlcz_grammar_and_render(self) -> None:
-        self.assertEqual(len(PRESET_ORDER), 8)
+    def test_all_nine_presets_mlcz_grammar_and_render(self) -> None:
+        self.assertEqual(len(PRESET_ORDER), 9)
+        self.assertEqual(PRESET_ORDER[0], "disco-girl")
+        self.assertEqual(resolve_preset_id("disco-nous"), "disco-girl")
         counts = {"M": 2, "L": 2, "C": 6, "Z": 0}
         gen_mod = _load_generate_icons_module()
 
@@ -87,7 +89,7 @@ class TestPresetsAndValidation(unittest.TestCase):
             el = ET.fromstring(paths[0])
             gen_mod.drag_bottom_nodes(el, cutoff=5000.0, band=100.0, distance=50.0)
 
-            # Verify clean centered squircle rendering
+            # Verify clean squircle rendering
             renderer = IconRenderer(IconConfig(mode="preset", preset=pid))
             sq_light = renderer.render_squircle(256, dark=False, mac_grid=False)
             sq_dark = renderer.render_squircle(256, dark=True, mac_grid=False)
@@ -95,6 +97,15 @@ class TestPresetsAndValidation(unittest.TestCase):
             self.assertEqual(sq_dark.size, (256, 256))
             self.assertEqual(sq_light.getchannel("A").getextrema(), (0, 255))
             self.assertEqual(sq_dark.getchannel("A").getextrema(), (0, 255))
+
+        # Verify disco-girl bottom-anchors flush to the bottom edge and preserves chrome shading
+        disco_sq = IconRenderer(IconConfig(mode="preset", preset="disco-girl")).render_squircle(
+            256, dark=False, mac_grid=False
+        )
+        # Bottom center pixel inside squircle should be opaque portrait pixel (not pure white)
+        r, g, b, a = disco_sq.getpixel((128, 254))
+        self.assertEqual(a, 255)
+        self.assertLess((r + g + b) / 3, 250)
 
 
 class TestCustomIcons(unittest.TestCase):
@@ -229,7 +240,8 @@ class TestGuiServer(unittest.TestCase):
 
             with urllib.request.urlopen(url + "api/status") as r:
                 data = json.loads(r.read().decode("utf-8"))
-                self.assertEqual(len(data["presets"]), 8)
+                self.assertEqual(len(data["presets"]), 9)
+                self.assertEqual(data["presets"][0]["id"], "disco-girl")
 
             with urllib.request.urlopen(url + "api/preview?mode=preset&preset=caduceus&appearance=light") as r:
                 png = r.read()
@@ -298,7 +310,7 @@ class TestLockAndWatcherConfig(unittest.TestCase):
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.0")
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.1")
 
     def test_homebrew_cellar_opt_resolution(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hermes-brew-test-") as tmp:
@@ -350,12 +362,13 @@ class TestTuiAlignment(unittest.TestCase):
         ansi_strip = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
         for term_cols, expected_preview_len, expected_rows in ((90, 36, 18), (125, 75, 18)):
             cache: dict[str, list[str]] = {}
-            for active_preset in ("caduceus", "monogram-h", "shield"):
+            for active_preset in ("disco-girl", "caduceus", "shield"):
                 cfg = IconConfig(mode="preset", preset=active_preset)
                 for selected_idx in range(len(PRESET_ORDER)):
                     frame = render_tui_frame(cfg, selected_idx, cache, term_cols=term_cols)
                     plain = ansi_strip.sub("", frame)
                     self.assertIn("[g] Web GUI", plain)
+                    self.assertIn("1-9]", plain)
                     if term_cols >= 116:
                         hdr_lines = [ln for ln in plain.splitlines() if "Light" in ln and "Dark" in ln]
                         self.assertEqual(len(hdr_lines), 1)
@@ -437,7 +450,7 @@ class TestLiveIntegrationAndSelfHealing(unittest.TestCase):
 
         # 4. Verify upstream generate_icons.py --source/--out + --check compatibility
         up_res = apply_to_repo(
-            IconConfig(mode="preset", preset="caduceus"),
+            IconConfig(mode="preset", preset="disco-girl"),
             repo=HERMES_REPO,
             run_upstream_generator=True,
             run_upstream_check=True,

@@ -158,7 +158,7 @@ def render_tui_frame(
     sel_preset = PRESETS[pid]
     out.append(f"\n  \x1b[1m{sel_preset.name}\x1b[0m — {sel_preset.description}\n")
     out.append(
-        "\n  \x1b[2m[↑/↓ or 1-8]\x1b[0m Select   "
+        f"\n  \x1b[2m[↑/↓ or 1-{len(PRESET_ORDER)}]\x1b[0m Select   "
         "\x1b[2m[Enter]\x1b[0m Apply   "
         "\x1b[2m[f]\x1b[0m Finder picker   "
         "\x1b[2m[c]\x1b[0m Custom path   "

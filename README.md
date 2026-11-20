@@ -4,7 +4,7 @@ A macOS utility to customize the Hermes desktop application icon across every su
 
 ## Features
 
-- **8 Curated Vector Presets**: Crisp geometric emblems rendered in both light and dark squircle plates (`caduceus`, `winged-helmet`, `winged-sandal`, `monogram-h`, `neural-core`, `compass`, `terminal`, `shield`).
+- **9 Curated Presets**: Mirror-mosaic chrome portrait (`disco-girl`) plus 8 geometric vector emblems rendered in both light and dark squircle plates (`caduceus`, `winged-helmet`, `winged-sandal`, `monogram-h`, `neural-core`, `compass`, `terminal`, `shield`).
 - **Custom Icon Support**: Use any `.svg`, `.png`, `.icns`, `.jpg`, or `.webp` file (with optional `--custom-dark`, `--scale`, `--full-bleed`, and `--bg-light`/`--bg-dark` plate colors).
 - **Three Interfaces**:
   - **CLI** (`hermes-icon list`, `hermes-icon set ...`, `hermes-icon status`)
@@ -90,7 +90,8 @@ hermes-icon restore
 
 | ID | Name | Description |
 | --- | --- | --- |
-| `caduceus` | Hermes Caduceus | Classic winged staff with twin serpents (default) |
+| `disco-girl` | Disco Nous | Mirror-mosaic chrome portrait on transparent background (default) |
+| `caduceus` | Hermes Caduceus | Classic winged staff with twin serpents |
 | `winged-helmet` | Hermes Petasos | Winged traveler's helmet with arched brim |
 | `winged-sandal` | Talaria Wing | Classic winged Greek sandal emblem |
 | `monogram-h` | Geometric H Monogram | Architectural `H` in an octagonal frame |

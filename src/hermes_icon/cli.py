@@ -16,12 +16,13 @@ from .config import (
     DEFAULT_BG_LIGHT,
     DEFAULT_FG_DARK,
     DEFAULT_FG_LIGHT,
+    DEFAULT_PRESET,
     IconConfig,
     load_config,
     normalize_hex_color,
     save_config,
 )
-from .presets import PRESET_ORDER, PRESETS
+from .presets import PRESET_ORDER, PRESETS, resolve_preset_id
 from .watcher import install_watcher, uninstall_watcher, watcher_status
 
 
@@ -38,7 +39,7 @@ def _cmd_list(_args: argparse.Namespace) -> int:
     for idx, pid in enumerate(PRESET_ORDER, 1):
         p = PRESETS[pid]
         mark = "*" if (cfg.mode == "preset" and cfg.preset == pid) else " "
-        default_tag = " (default)" if pid == "caduceus" else ""
+        default_tag = " (default)" if pid == DEFAULT_PRESET else ""
         print(f"  {mark} {idx}. {pid:<15s}  {p.name}{default_tag} — {p.tagline}")
     return 0
 
@@ -78,7 +79,8 @@ def _cmd_set(args: argparse.Namespace) -> int:
         if not args.preset:
             print("Error: specify a preset name or --custom <path>.", file=sys.stderr)
             return 2
-        if args.preset not in PRESETS:
+        resolved_preset = resolve_preset_id(args.preset)
+        if resolved_preset not in PRESETS:
             print(
                 f"Error: unknown preset {args.preset!r}. Choose from: {', '.join(PRESET_ORDER)}",
                 file=sys.stderr,
@@ -86,7 +88,7 @@ def _cmd_set(args: argparse.Namespace) -> int:
             return 2
         new_cfg = IconConfig(
             mode="preset",
-            preset=args.preset,
+            preset=resolved_preset,
             scale=args.scale if args.scale is not None else cur.scale,
             bg_light=bg_light,
             bg_dark=bg_dark,

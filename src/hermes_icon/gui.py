@@ -280,8 +280,8 @@ HTML_PAGE = """<!doctype html>
 <script>
 const state = {
   mode: "preset",
-  preset: "caduceus",
-  activePreset: "caduceus",
+  preset: "disco-girl",
+  activePreset: "disco-girl",
   activeMode: "preset",
   bg_light: "#ffffff",
   bg_dark: "#0d1117",
@@ -361,7 +361,7 @@ async function refreshStatus() {
   state.activeMode = data.config.mode;
   if (!state._initialized) {
     state.mode = data.config.mode;
-    state.preset = data.config.preset || "caduceus";
+    state.preset = data.config.preset || "disco-girl";
     state.bg_light = data.config.bg_light || "#ffffff";
     state.bg_dark = data.config.bg_dark || "#0d1117";
     state.scale = data.config.scale || 0.78;

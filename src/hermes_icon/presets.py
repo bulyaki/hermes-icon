@@ -12,11 +12,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Iterable
+
+from PIL import Image
 
 VIEWBOX = 5487.0615
 CENTER = VIEWBOX / 2.0
 KAPPA = 0.5522847498307936
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+_ASSET_PATH_CACHE: dict[str, str] = {}
 
 
 @dataclass(frozen=True)
@@ -26,6 +31,8 @@ class Preset:
     tagline: str
     description: str
     build_path: Callable[[], str]
+    image_asset: str | None = None
+    bottom_anchored: bool = False
 
 
 def _f(v: float) -> str:
@@ -676,7 +683,62 @@ def _build_shield() -> str:
     return " ".join(paths)
 
 
+def _build_disco_girl() -> str:
+    """Trace disco-girl.png silhouette to a valid explicit M/L/Z path (cached)."""
+    cache_key = "disco-girl.png"
+    if cache_key in _ASSET_PATH_CACHE:
+        return _ASSET_PATH_CACHE[cache_key]
+
+    asset_path = ASSETS_DIR / cache_key
+    grid = 96
+    with Image.open(asset_path) as im:
+        rgba = im.convert("RGBA")
+        iw, ih = rgba.size
+        inner = 84
+        sc = min(inner / iw, inner / ih)
+        nw = max(1, round(iw * sc))
+        nh = max(1, round(ih * sc))
+        resized = rgba.resize((nw, nh), Image.LANCZOS)
+        canvas = Image.new("RGBA", (grid, grid), (0, 0, 0, 0))
+        canvas.alpha_composite(resized, ((grid - nw) // 2, grid - nh))
+
+    alpha = canvas.getchannel("A")
+    px = alpha.load()
+    cell = VIEWBOX / grid
+    parts: list[str] = []
+    for y in range(grid):
+        x = 0
+        while x < grid:
+            if px[x, y] >= 64:
+                x0 = x
+                while x < grid and px[x, y] >= 64:
+                    x += 1
+                rx0 = x0 * cell
+                rx1 = x * cell
+                ry0 = y * cell
+                ry1 = (y + 1) * cell
+                parts.append(
+                    f"M {rx0:.2f} {ry0:.2f} L {rx1:.2f} {ry0:.2f} "
+                    f"L {rx1:.2f} {ry1:.2f} L {rx0:.2f} {ry1:.2f} Z"
+                )
+            else:
+                x += 1
+
+    d = " ".join(parts) if parts else "M 1000.00 1000.00 L 4487.00 1000.00 L 4487.00 4487.00 L 1000.00 4487.00 Z"
+    _ASSET_PATH_CACHE[cache_key] = d
+    return d
+
+
 PRESETS: dict[str, Preset] = {
+    "disco-girl": Preset(
+        id="disco-girl",
+        name="Disco Nous",
+        tagline="Mirror-mosaic chrome portrait on transparent background",
+        description="Chrome disco-tile portrait cutout over light and dark squircle plates.",
+        build_path=_build_disco_girl,
+        image_asset="disco-girl.png",
+        bottom_anchored=True,
+    ),
     "caduceus": Preset(
         id="caduceus",
         name="Hermes Caduceus",
@@ -736,6 +798,7 @@ PRESETS: dict[str, Preset] = {
 }
 
 PRESET_ORDER = [
+    "disco-girl",
     "caduceus",
     "winged-helmet",
     "winged-sandal",
@@ -746,8 +809,17 @@ PRESET_ORDER = [
     "shield",
 ]
 
+PRESET_ALIASES = {
+    "disco-nous": "disco-girl",
+}
+
+
+def resolve_preset_id(preset_id: str) -> str:
+    return PRESET_ALIASES.get(preset_id, preset_id)
+
 
 def build_preset_svg(preset_id: str, fill: str = "#000000") -> str:
+    preset_id = resolve_preset_id(preset_id)
     if preset_id not in PRESETS:
         raise ValueError(f"Unknown preset: {preset_id!r}")
     d = PRESETS[preset_id].build_path()

@@ -30,7 +30,7 @@ from .config import (
     HERMES_REPO,
     IconConfig,
 )
-from .presets import PRESETS, VIEWBOX, build_preset_svg
+from .presets import ASSETS_DIR, PRESETS, VIEWBOX, build_preset_svg, resolve_preset_id
 
 ICON_CANVAS = 1024
 MAC_TILE_OFFSET = 100
@@ -213,6 +213,33 @@ def _compose_squircle_from_image(
     return plate
 
 
+def _compose_bottom_anchored_squircle(
+    fg_img: Image.Image,
+    size: int,
+    bg_hex: str,
+    *,
+    mac_grid: bool = False,
+    scale: float = 0.78,
+) -> Image.Image:
+    """Composite a portrait cutout flush with the bottom of the squircle and clip corners."""
+    plate = _squircle_plate(size, bg_hex, mac_grid=mac_grid)
+    trimmed = _trim_alpha(fg_img)
+    tile_side = (size * MAC_TILE_SIZE / 1024.0) if mac_grid else float(size)
+    # Portrait fills ~90% of tile height at default scale=0.78 so shoulders sit flush at bottom
+    eff_scale = min(0.95, max(0.45, scale * (0.90 / 0.78)))
+    box = max(1, round(tile_side * eff_scale))
+    fitted = _fit_centered(trimmed, box, box)
+    ox = (size - fitted.width) // 2
+    tile_bottom = round(size * (MAC_TILE_OFFSET + MAC_TILE_SIZE) / 1024.0) if mac_grid else size
+    oy = tile_bottom - fitted.height
+    fg_layer = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    fg_layer.alpha_composite(fitted, (ox, oy))
+    mask = _squircle_mask(size, mac_grid=mac_grid)
+    fg_layer.putalpha(ImageChops.darker(fg_layer.getchannel("A"), mask))
+    plate.alpha_composite(fg_layer)
+    return plate
+
+
 def _trace_alpha_to_mlz_svg(img: Image.Image, fill: str) -> str:
     """Convert an RGBA image into a valid single-<path> M/L/Z SVG in 5487.0615 viewBox.
 
@@ -339,6 +366,9 @@ class IconRenderer:
 
         self._light_fg_img: Image.Image | None = None
         self._dark_fg_img: Image.Image | None = None
+        self._preset_id: str | None = None
+        self._preset_img: Image.Image | None = None
+        self._bottom_anchored: bool = False
         self._full_bleed: bool = False
         self._svg_light_text: str | None = None
         self._svg_dark_text: str | None = None
@@ -361,16 +391,24 @@ class IconRenderer:
                 self._svg_dark_text = raw_svg
             self._full_bleed = cfg.full_bleed if cfg.full_bleed is not None else _detect_full_bleed(light_img, ext)
         else:
-            if cfg.preset not in PRESETS:
+            pid = resolve_preset_id(cfg.preset)
+            if pid not in PRESETS:
                 raise ValueError(f"Unknown preset: {cfg.preset!r}")
+            self._preset_id = pid
+            preset_obj = PRESETS[pid]
+            self._bottom_anchored = preset_obj.bottom_anchored
+            if preset_obj.image_asset:
+                with Image.open(ASSETS_DIR / preset_obj.image_asset) as im:
+                    self._preset_img = im.convert("RGBA")
             self._full_bleed = False
 
     def source_svgs(self) -> tuple[str, str]:
         """Return (nous-girl-black.svg, nous-girl-white.svg) compatible with generate_icons.py."""
         if not self.is_custom:
+            assert self._preset_id is not None
             return (
-                build_preset_svg(self.cfg.preset, self.fg_light),
-                build_preset_svg(self.cfg.preset, self.fg_dark),
+                build_preset_svg(self._preset_id, self.fg_light),
+                build_preset_svg(self._preset_id, self.fg_dark),
             )
         assert self._light_fg_img is not None and self._dark_fg_img is not None
         return (
@@ -382,10 +420,14 @@ class IconRenderer:
         """Render the standalone emblem/artwork on transparency (``size``x``size``)."""
         if dark not in self._fg_1024_cache:
             if not self.is_custom:
-                fg = self.fg_dark if dark else self.fg_light
-                svg = build_preset_svg(self.cfg.preset, fg)
-                data = resvg_py.svg_to_bytes(svg_string=svg, width=ICON_CANVAS, height=ICON_CANVAS)
-                img = Image.open(io.BytesIO(data)).convert("RGBA")
+                if self._preset_img is not None:
+                    img = self._preset_img
+                else:
+                    assert self._preset_id is not None
+                    fg = self.fg_dark if dark else self.fg_light
+                    svg = build_preset_svg(self._preset_id, fg)
+                    data = resvg_py.svg_to_bytes(svg_string=svg, width=ICON_CANVAS, height=ICON_CANVAS)
+                    img = Image.open(io.BytesIO(data)).convert("RGBA")
             else:
                 raw_svg = self._svg_dark_text if dark else self._svg_light_text
                 if raw_svg is not None:
@@ -397,9 +439,8 @@ class IconRenderer:
             trimmed = _trim_alpha(img)
             fitted = _fit_centered(trimmed, ICON_CANVAS, ICON_CANVAS)
             canvas = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
-            canvas.alpha_composite(
-                fitted, ((ICON_CANVAS - fitted.width) // 2, (ICON_CANVAS - fitted.height) // 2)
-            )
+            oy = (ICON_CANVAS - fitted.height) if self._bottom_anchored else ((ICON_CANVAS - fitted.height) // 2)
+            canvas.alpha_composite(fitted, ((ICON_CANVAS - fitted.width) // 2, oy))
             self._fg_1024_cache[dark] = canvas
 
         base = self._fg_1024_cache[dark]
@@ -413,10 +454,30 @@ class IconRenderer:
         if key not in self._squircle_1024_cache:
             bg = self.bg_dark if dark else self.bg_light
             if not self.is_custom:
-                fg = self.fg_dark if dark else self.fg_light
-                master = _preset_master_svg(self.cfg.preset, bg, fg, mac_grid=mac_grid, scale=self.scale)
-                data = resvg_py.svg_to_bytes(svg_string=master, width=ICON_CANVAS, height=ICON_CANVAS)
-                self._squircle_1024_cache[key] = Image.open(io.BytesIO(data)).convert("RGBA")
+                if self._preset_img is not None:
+                    if self._bottom_anchored:
+                        self._squircle_1024_cache[key] = _compose_bottom_anchored_squircle(
+                            self._preset_img,
+                            ICON_CANVAS,
+                            bg,
+                            mac_grid=mac_grid,
+                            scale=self.scale,
+                        )
+                    else:
+                        self._squircle_1024_cache[key] = _compose_squircle_from_image(
+                            self._preset_img,
+                            ICON_CANVAS,
+                            bg,
+                            mac_grid=mac_grid,
+                            scale=self.scale,
+                            full_bleed=False,
+                        )
+                else:
+                    assert self._preset_id is not None
+                    fg = self.fg_dark if dark else self.fg_light
+                    master = _preset_master_svg(self._preset_id, bg, fg, mac_grid=mac_grid, scale=self.scale)
+                    data = resvg_py.svg_to_bytes(svg_string=master, width=ICON_CANVAS, height=ICON_CANVAS)
+                    self._squircle_1024_cache[key] = Image.open(io.BytesIO(data)).convert("RGBA")
             else:
                 raw_svg = self._svg_dark_text if dark else self._svg_light_text
                 if raw_svg is not None:
@@ -450,6 +511,14 @@ class IconRenderer:
         # scale inside 1024 canvas matches mac_grid squircle proportions.
         fg = self.render_foreground(ICON_CANVAS, dark=dark)
         trimmed = _trim_alpha(fg)
+        if self._bottom_anchored:
+            eff_scale = min(0.95, max(0.45, self.scale * (0.90 / 0.78)))
+            box = max(1, round(ICON_CANVAS * eff_scale))
+            fitted = _fit_centered(trimmed, box, box)
+            canvas = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
+            canvas.alpha_composite(fitted, ((ICON_CANVAS - fitted.width) // 2, ICON_CANVAS - fitted.height))
+            return canvas
+
         box = max(1, round(ICON_CANVAS * self.scale))
         fitted = _fit_centered(trimmed, box, box)
         canvas = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (0, 0, 0, 0))
@@ -459,18 +528,17 @@ class IconRenderer:
     def render_icon_mono(self) -> Image.Image:
         """1024x1024 Clear/Tinted frosted glass material for Icon Composer."""
         art = self.render_icon_art(dark=False)
-        if not self.is_custom:
+        if not self.is_custom and self._preset_img is None:
             alpha = art.getchannel("A")
             out = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (255, 255, 255, 0))
             out.putalpha(alpha)
             return out
 
-        # For custom artwork: convert luminance + alpha to translucent glass material
+        # For full-color raster/preset artwork: convert luminance + alpha to translucent glass material
         luma = art.convert("L")
         alpha = art.getchannel("A")
-        if self._full_bleed:
-            # Modulate opacity by luminance so opaque photos stay legible under Tinted/Clear
-            glass_alpha = ImageChops.multiply(alpha, luma.point(lambda v: max(40, min(255, v))))
+        if self._full_bleed or self._preset_img is not None:
+            glass_alpha = ImageChops.multiply(alpha, luma.point(lambda v: max(55, min(255, v))))
         else:
             glass_alpha = alpha
         out = Image.new("RGBA", (ICON_CANVAS, ICON_CANVAS), (242, 242, 247, 0))
@@ -524,10 +592,11 @@ class IconRenderer:
         return json.dumps(manifest, indent=2) + "\n"
 
     def render_master_svg(self, *, dark: bool = False) -> str:
-        if not self.is_custom:
+        if not self.is_custom and self._preset_img is None:
+            assert self._preset_id is not None
             bg = self.bg_dark if dark else self.bg_light
             fg = self.fg_dark if dark else self.fg_light
-            return _preset_master_svg(self.cfg.preset, bg, fg, mac_grid=False, scale=self.scale)
+            return _preset_master_svg(self._preset_id, bg, fg, mac_grid=False, scale=self.scale)
         return _raster_master_svg(self.render_squircle(1024, dark=dark, mac_grid=False), 1024)
 
     def render_target_bytes(self, rel: str, kind: str, arg: Any, dmg_png_path: Path) -> bytes:

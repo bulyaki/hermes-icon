@@ -46,7 +46,7 @@ DEFAULT_BG_LIGHT = "#ffffff"
 DEFAULT_BG_DARK = "#0d1117"
 DEFAULT_FG_LIGHT = "#000000"
 DEFAULT_FG_DARK = "#ffffff"
-DEFAULT_PRESET = "caduceus"
+DEFAULT_PRESET = "disco-girl"
 
 
 @dataclass
