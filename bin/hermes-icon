@@ -2,7 +2,7 @@
 set -eu
 
 if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
-    echo "hermes-icon 0.1.2"
+    echo "hermes-icon 0.1.3"
     exit 0
 fi
 
@@ -22,23 +22,35 @@ USER_HOME="/Users/$(id -un)"
 
 search_hermes_python() {
     base_dir="$1"
+    if [ -x "$base_dir/icon-replacer/.venv/bin/python" ]; then
+        printf '%s\n' "$base_dir/icon-replacer/.venv/bin/python"
+        return 0
+    fi
+
     installs_dir="$base_dir/installs"
-    [ -d "$installs_dir" ] || return 1
+    if [ -d "$installs_dir" ]; then
+        # 1. Inspect $HERMES_HOME/installs/*/facts.json for packages.venv.environment
+        for facts in "$installs_dir"/*/facts.json; do
+            [ -f "$facts" ] || continue
+            env_dir=$(sed -n 's/.*"environment"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$facts" | head -n 1)
+            if [ -n "$env_dir" ] && [ -x "$env_dir/bin/python" ]; then
+                printf '%s\n' "$env_dir/bin/python"
+                return 0
+            fi
+        done
 
-    # 1. Inspect $HERMES_HOME/installs/*/facts.json for packages.venv.environment
-    for facts in "$installs_dir"/*/facts.json; do
-        [ -f "$facts" ] || continue
-        env_dir=$(sed -n 's/.*"environment"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$facts" | head -n 1)
-        if [ -n "$env_dir" ] && [ -x "$env_dir/bin/python" ]; then
-            printf '%s\n' "$env_dir/bin/python"
-            return 0
-        fi
-    done
+        # 2. Fallback: search $HERMES_HOME/installs/*/environments/*/venv/bin/python
+        for py in "$installs_dir"/*/environments/*/venv/bin/python; do
+            if [ -x "$py" ]; then
+                printf '%s\n' "$py"
+                return 0
+            fi
+        done
+    fi
 
-    # 2. Fallback: search $HERMES_HOME/installs/*/environments/*/venv/bin/python
-    for py in "$installs_dir"/*/environments/*/venv/bin/python; do
-        if [ -x "$py" ]; then
-            printf '%s\n' "$py"
+    for venv_py in "$base_dir/hermes-agent/.venv/bin/python" "$base_dir/hermes-agent/venv/bin/python"; do
+        if [ -x "$venv_py" ]; then
+            printf '%s\n' "$venv_py"
             return 0
         fi
     done
@@ -47,6 +59,16 @@ search_hermes_python() {
 }
 
 resolve_python() {
+    if [ -n "${HERMES_PYTHON:-}" ] && [ -x "$HERMES_PYTHON" ]; then
+        printf '%s\n' "$HERMES_PYTHON"
+        return 0
+    fi
+
+    if [ -n "${HERMES_ICON_STATE_DIR:-}" ] && [ -x "$HERMES_ICON_STATE_DIR/.venv/bin/python" ]; then
+        printf '%s\n' "$HERMES_ICON_STATE_DIR/.venv/bin/python"
+        return 0
+    fi
+
     primary_home="${HERMES_HOME:-$HOME/.hermes}"
     if search_hermes_python "$primary_home"; then
         return 0
@@ -58,11 +80,8 @@ resolve_python() {
     fi
 
     if command -v python3 >/dev/null 2>&1; then
-        sys_py=$(command -v python3)
-        if "$sys_py" -I -c "import PIL, resvg_py" >/dev/null 2>&1; then
-            printf '%s\n' "$sys_py"
-            return 0
-        fi
+        command -v python3
+        return 0
     fi
 
     return 1
@@ -70,7 +89,7 @@ resolve_python() {
 
 HERMES_PY=$(resolve_python || true)
 if [ -z "$HERMES_PY" ]; then
-    echo "hermes-icon: could not locate active Hermes Python interpreter (with Pillow and resvg_py)" >&2
+    echo "hermes-icon: could not locate Python 3 interpreter" >&2
     exit 1
 fi
 

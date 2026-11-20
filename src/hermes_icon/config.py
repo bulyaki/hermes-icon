@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,18 +17,171 @@ IS_MACOS = sys.platform == "darwin"
 APP_ROOT = Path(__file__).resolve().parents[2]
 BIN_DIR = APP_ROOT / "bin"
 
-HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes")))
-HERMES_REPO = Path(os.environ.get("HERMES_REPO", str(HERMES_HOME / "hermes-agent")))
+
+def candidate_hermes_homes(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> list[Path]:
+    """Return candidate Hermes home directories in priority order."""
+    env = environ if environ is not None else os.environ
+    user_home = home if home is not None else Path.home()
+    plat = platform if platform is not None else sys.platform
+
+    candidates: list[Path] = []
+    env_home = env.get("HERMES_HOME", "").strip()
+    if env_home:
+        candidates.append(Path(env_home).expanduser())
+    if plat == "win32":
+        local_app_data = env.get("LOCALAPPDATA", "").strip()
+        local_base = Path(local_app_data) if local_app_data else (user_home / "AppData" / "Local")
+        candidates.append(local_base / "hermes")
+    candidates.append(user_home / ".hermes")
+
+    out: list[Path] = []
+    seen: set[Path] = set()
+    for cand in candidates:
+        if cand not in seen:
+            seen.add(cand)
+            out.append(cand)
+    return out
+
+
+def resolve_hermes_home(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Resolve active Hermes home directory across platforms.
+
+    On Windows, checks ``%HERMES_HOME%``, ``%LOCALAPPDATA%\\hermes``, and
+    ``%USERPROFILE%\\.hermes`` in order, picking the first existing directory
+    and defaulting to ``%LOCALAPPDATA%\\hermes``.
+    """
+    env = environ if environ is not None else os.environ
+    cands = candidate_hermes_homes(environ=env, home=home, platform=platform)
+    for cand in cands:
+        if cand.is_dir():
+            return cand
+    return cands[0]
+
+
+def windows_packaged_app_candidates(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    """Return standard install directories for the packaged Windows Hermes desktop app."""
+    env = environ if environ is not None else os.environ
+    user_home = home if home is not None else Path.home()
+    local_app_data = env.get("LOCALAPPDATA", "").strip()
+    local_base = Path(local_app_data) if local_app_data else (user_home / "AppData" / "Local")
+    cands = [
+        local_base / "Programs" / "Hermes",
+        local_base / "hermes-desktop",
+    ]
+    program_files = env.get("ProgramFiles", "").strip()
+    if program_files:
+        cands.append(Path(program_files) / "Hermes")
+    return cands
+
+
+def discover_packaged_payload_dirs(
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> list[Path]:
+    """Return existing packaged desktop ``agent-payload`` directories."""
+    env = environ if environ is not None else os.environ
+    user_home = home if home is not None else Path.home()
+    plat = platform if platform is not None else sys.platform
+
+    candidates: list[Path] = []
+    if plat == "win32":
+        for app_dir in windows_packaged_app_candidates(environ=env, home=user_home):
+            candidates.append(app_dir / "resources" / "agent-payload")
+        program_files = env.get("ProgramFiles", "").strip()
+        if program_files:
+            win_apps = Path(program_files) / "WindowsApps"
+            with contextlib.suppress(OSError):
+                if win_apps.is_dir():
+                    for pkg in sorted(win_apps.glob("NousResearch.Hermes*")):
+                        candidates.append(pkg / "app" / "resources" / "agent-payload")
+                        candidates.append(pkg / "resources" / "agent-payload")
+    elif plat == "darwin":
+        candidates.extend(
+            [
+                Path("/Applications/Hermes.app/Contents/Resources/agent-payload"),
+                user_home / "Applications" / "Hermes.app" / "Contents" / "Resources" / "agent-payload",
+            ]
+        )
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for cand in candidates:
+        if cand not in seen and cand.is_dir():
+            seen.add(cand)
+            found.append(cand)
+    return found
+
+
+def resolve_hermes_repo(
+    hermes_home: Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Resolve the Hermes repository checkout if present on disk."""
+    env = environ if environ is not None else os.environ
+    env_repo = env.get("HERMES_REPO", "").strip()
+    if env_repo:
+        return Path(env_repo).expanduser()
+
+    for cand_home in candidate_hermes_homes(environ=env, home=home, platform=platform):
+        cand_repo = cand_home / "hermes-agent"
+        if cand_repo.is_dir():
+            return cand_repo
+
+    for payload_dir in discover_packaged_payload_dirs(environ=env, home=home, platform=platform):
+        cand_repo = payload_dir / "repo"
+        if cand_repo.is_dir():
+            return cand_repo
+
+    base_home = hermes_home or resolve_hermes_home(environ=env, home=home, platform=platform)
+    return base_home / "hermes-agent"
+
+
+def resolve_replacer_root(
+    hermes_home: Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+    platform: str | None = None,
+) -> Path:
+    """Resolve hermes-icon runtime state directory."""
+    env = environ if environ is not None else os.environ
+    override = env.get("HERMES_ICON_STATE_DIR", "").strip()
+    if override:
+        return Path(override).expanduser()
+    base_home = hermes_home or resolve_hermes_home(environ=env, home=home, platform=platform)
+    return base_home / "icon-replacer"
+
+
+HERMES_HOME = resolve_hermes_home()
+HERMES_REPO = resolve_hermes_repo(HERMES_HOME)
 HERMES_UPDATE_LOCK = HERMES_HOME / ".hermes-update-in-progress.lock"
 HERMES_UPDATE_MARKER = HERMES_HOME / ".hermes-update-in-progress"
 
-REPLACER_ROOT = Path(
-    os.environ.get("HERMES_ICON_STATE_DIR", str(HERMES_HOME / "icon-replacer"))
-)
+REPLACER_ROOT = resolve_replacer_root(HERMES_HOME)
 ICON_REPLACER_DIR = REPLACER_ROOT
 BACKUPS_ORIGINAL_DIR = REPLACER_ROOT / "backups" / "original"
 BACKUPS_MANIFEST = BACKUPS_ORIGINAL_DIR / "manifest.json"
 CUSTOM_ASSETS_DIR = REPLACER_ROOT / "custom-cache"
+STAGED_REPO_DIR = REPLACER_ROOT / "staged-repo"
 LOGS_DIR = REPLACER_ROOT / "logs"
 CONFIG_PATH = REPLACER_ROOT / "config.json"
 STATE_PATH = REPLACER_ROOT / "state.json"
@@ -41,16 +196,30 @@ HERMES_APP = HERMES_REPO / "apps" / "desktop" / "release" / "mac-arm64" / "Herme
 APPLICATIONS_HERMES_APP = Path("/Applications/Hermes.app")
 
 
-def discover_windows_app_dirs(repo: Path = HERMES_REPO) -> list[Path]:
+def discover_windows_app_dirs(
+    repo: Path = HERMES_REPO,
+    *,
+    environ: Mapping[str, str] | None = None,
+    home: Path | None = None,
+) -> list[Path]:
     """Return unpacked Windows Electron desktop app directories containing resources/app.asar or Hermes.exe."""
+    env = environ if environ is not None else os.environ
+    user_home = home if home is not None else Path.home()
     candidates: list[Path] = [
         repo / "apps" / "desktop" / "release" / "win-unpacked",
         repo / "apps" / "desktop" / "release" / "win-arm64-unpacked",
         repo / "apps" / "desktop" / "release" / "win-ia32-unpacked",
     ]
-    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-    if local_app_data:
-        candidates.append(Path(local_app_data) / "Programs" / "Hermes")
+    for cand_home in candidate_hermes_homes(environ=env, home=user_home, platform="win32"):
+        rel_dir = cand_home / "hermes-agent" / "apps" / "desktop" / "release"
+        candidates.extend(
+            [
+                rel_dir / "win-unpacked",
+                rel_dir / "win-arm64-unpacked",
+                rel_dir / "win-ia32-unpacked",
+            ]
+        )
+    candidates.extend(windows_packaged_app_candidates(environ=env, home=user_home))
 
     found: list[Path] = []
     seen: set[Path] = set()

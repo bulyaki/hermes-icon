@@ -34,6 +34,7 @@ from .config import (
     HERMES_UPDATE_MARKER,
     LOGS_DIR,
     REPLACER_LOCK_PATH,
+    STAGED_REPO_DIR,
     IconConfig,
     discover_windows_app_dirs,
     ensure_dirs,
@@ -66,7 +67,7 @@ def _read_lock_holder(lock_path: Path) -> dict[str, Any] | None:
         raw = lock_path.read_text(encoding="utf-8").strip()
         if not raw:
             return None
-        data = json.loads(raw)
+        data, _ = json.JSONDecoder().raw_decode(raw)
         return data if isinstance(data, dict) else None
     except Exception:
         return None
@@ -301,16 +302,22 @@ def _tracked_surface_paths(
     applications_app: Path = APPLICATIONS_HERMES_APP,
     win_app_dirs: list[Path] | None = None,
 ) -> dict[str, Path]:
-    surfaces: dict[str, Path] = {
-        "repo/assets/nous-girl-black.svg": repo / "assets" / "nous-girl-black.svg",
-        "repo/assets/nous-girl-white.svg": repo / "assets" / "nous-girl-white.svg",
-        "repo/apps/desktop/assets/icon.icns": repo / "apps" / "desktop" / "assets" / "icon.icns",
-        "repo/apps/desktop/assets/icon-mac.png": repo / "apps" / "desktop" / "assets" / "icon-mac.png",
-        "repo/apps/desktop/public/nous-girl.png": repo / "apps" / "desktop" / "public" / "nous-girl.png",
-        "repo/apps/desktop/public/nous-girl-dark.png": repo / "apps" / "desktop" / "public" / "nous-girl-dark.png",
-        "repo/apps/desktop/public/apple-touch-icon.png": repo / "apps" / "desktop" / "public" / "apple-touch-icon.png",
-        "repo/hermes_cli/web_dist/favicon.ico": repo / "hermes_cli" / "web_dist" / "favicon.ico",
-    }
+    surfaces: dict[str, Path] = {}
+    if (repo / "assets").is_dir():
+        surfaces.update(
+            {
+                "repo/assets/nous-girl-black.svg": repo / "assets" / "nous-girl-black.svg",
+                "repo/assets/nous-girl-white.svg": repo / "assets" / "nous-girl-white.svg",
+                "repo/apps/desktop/assets/icon.icns": repo / "apps" / "desktop" / "assets" / "icon.icns",
+                "repo/apps/desktop/assets/icon-mac.png": repo / "apps" / "desktop" / "assets" / "icon-mac.png",
+                "repo/apps/desktop/public/nous-girl.png": repo / "apps" / "desktop" / "public" / "nous-girl.png",
+                "repo/apps/desktop/public/nous-girl-dark.png": repo / "apps" / "desktop" / "public" / "nous-girl-dark.png",
+                "repo/apps/desktop/public/apple-touch-icon.png": repo / "apps" / "desktop" / "public" / "apple-touch-icon.png",
+            }
+        )
+        web_dist_dir = repo / "hermes_cli" / "web_dist"
+        if web_dist_dir.is_dir():
+            surfaces["repo/hermes_cli/web_dist/favicon.ico"] = web_dist_dir / "favicon.ico"
     if hermes_app.exists():
         surfaces.update(
             {
@@ -337,11 +344,17 @@ def _tracked_surface_paths(
         if icns.exists() and os.access(icns, os.W_OK):
             surfaces["applications_hermes_app/Contents/Resources/icon.icns"] = icns
 
-    for wdir in (win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)):
+    resolved_win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
+    win_name_counts: dict[str, int] = {}
+    for wdir in resolved_win_dirs:
+        win_name_counts[wdir.name] = win_name_counts.get(wdir.name, 0) + 1
+
+    for wdir in resolved_win_dirs:
         wres = wdir / "resources"
         if not wres.is_dir():
             continue
-        prefix = f"win_app/{wdir.name}/resources"
+        label = f"{wdir.parent.name}/{wdir.name}" if win_name_counts.get(wdir.name, 0) > 1 else wdir.name
+        prefix = f"win_app/{label}/resources"
         for rel, path in (
             (f"{prefix}/icon.ico", wres / "icon.ico"),
             (f"{prefix}/app.asar", wres / "app.asar"),
@@ -358,9 +371,10 @@ def compute_surface_hashes(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    win_app_dirs: list[Path] | None = None,
 ) -> dict[str, str]:
     out: dict[str, str] = {}
-    for key, path in _tracked_surface_paths(repo, hermes_app, applications_app).items():
+    for key, path in _tracked_surface_paths(repo, hermes_app, applications_app, win_app_dirs=win_app_dirs).items():
         if path.exists():
             out[key] = sha256_file(path)
     return out
@@ -653,6 +667,8 @@ def _apply_icon_locked(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    staged_repo: Path = STAGED_REPO_DIR,
+    win_app_dirs: list[Path] | None = None,
     save_active_config: bool = True,
     refresh_dock: bool = False,
     run_upstream_generator: bool = False,
@@ -664,22 +680,29 @@ def _apply_icon_locked(
             progress_cb(step, total, msg)
 
     # Always back up original files before first modification
-    ensure_original_backup(repo=repo, hermes_app=hermes_app, applications_app=applications_app)
+    ensure_original_backup(
+        repo=repo,
+        hermes_app=hermes_app,
+        applications_app=applications_app,
+        win_app_dirs=win_app_dirs,
+    )
     cfg = _cache_custom_files(cfg)
 
-    # 1. Repo & 99 generated targets
+    # 1. Repo (or staged-repo when repo is absent) & 99 generated targets
     emit(1, 4, "Rendering icon targets...")
     from .renderer import apply_to_repo
 
     repo_res = apply_to_repo(
         cfg,
         repo=repo,
+        staged_repo=staged_repo,
         run_upstream_generator=run_upstream_generator,
         run_upstream_check=run_upstream_check,
     )
+    asset_root = Path(repo_res.get("output_repo", str(repo)))
 
     # Web UI favicon
-    src_favicon = repo / "web" / "public" / "favicon.ico"
+    src_favicon = asset_root / "web" / "public" / "favicon.ico"
     dst_favicon = repo / "hermes_cli" / "web_dist" / "favicon.ico"
     if src_favicon.exists() and dst_favicon.parent.exists():
         shutil.copy2(src_favicon, dst_favicon)
@@ -690,8 +713,8 @@ def _apply_icon_locked(
         _wait_for_app_stability(hermes_app)
         res_dir = hermes_app / "Contents" / "Resources"
         info_plist = hermes_app / "Contents" / "Info.plist"
-        desktop_assets = repo / "apps" / "desktop" / "assets"
-        desktop_public = repo / "apps" / "desktop" / "public"
+        desktop_assets = asset_root / "apps" / "desktop" / "assets"
+        desktop_public = asset_root / "apps" / "desktop" / "public"
 
         emit(2, 4, "Compiling macOS 26 Assets.car...")
         assets_car_compiled = _compile_assets_car(desktop_assets / "icon.icon", res_dir / "Assets.car")
@@ -706,7 +729,7 @@ def _apply_icon_locked(
                 shutil.copy2(desktop_public / fname, unpacked_dist / fname)
 
         asar_path = res_dir / "app.asar"
-        replacements = _collect_asar_replacements(repo, asar_path)
+        replacements = _collect_asar_replacements(asset_root, asar_path)
         asar_res = patch_asar(asar_path, replacements, info_plist_path=info_plist)
 
         ok, errs = verify_asar_integrity(
@@ -732,29 +755,33 @@ def _apply_icon_locked(
     # /Applications/Hermes.app/Contents/Resources/icon.icns if present & writable
     apps_patched = False
     apps_icns = applications_app / "Contents" / "Resources" / "icon.icns"
-    if apps_icns.exists() and os.access(apps_icns, os.W_OK):
-        shutil.copy2(repo / "apps" / "desktop" / "assets" / "icon.icns", apps_icns)
+    src_icns = asset_root / "apps" / "desktop" / "assets" / "icon.icns"
+    if apps_icns.exists() and os.access(apps_icns, os.W_OK) and src_icns.exists():
+        shutil.copy2(src_icns, apps_icns)
         apps_patched = True
 
     # 4b. Windows unpacked Electron app dirs (if present)
-    win_dirs = discover_windows_app_dirs(repo)
-    win_results = [patch_windows_app_dir(wdir, repo) for wdir in win_dirs]
+    win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
+    win_results = [patch_windows_app_dir(wdir, asset_root) for wdir in win_dirs]
 
     # 5. Refresh OS icon caches
     refresh_paths = [hermes_app]
     if apps_patched:
         refresh_paths.append(applications_app)
     refresh_macos_icon_cache(refresh_paths, refresh_dock=refresh_dock)
-    if win_results:
-        refresh_windows_icon_cache(repo / "apps" / "desktop" / "assets" / "icon.ico")
-    elif sys.platform == "win32":
-        refresh_windows_icon_cache(repo / "apps" / "desktop" / "assets" / "icon.ico")
+    win_ico = asset_root / "apps" / "desktop" / "assets" / "icon.ico"
+    if win_dirs:
+        cand_ico = win_dirs[0] / "resources" / "icon.ico"
+        if cand_ico.exists():
+            win_ico = cand_ico
+    if win_results or sys.platform == "win32":
+        refresh_windows_icon_cache(win_ico)
 
     if save_active_config:
         cfg.watch_paused = False
         save_config(cfg)
 
-    hashes = compute_surface_hashes(repo, hermes_app, applications_app)
+    hashes = compute_surface_hashes(repo, hermes_app, applications_app, win_app_dirs=win_dirs)
     save_state(
         {
             "applied_at": datetime.now(timezone.utc).isoformat(),
@@ -780,6 +807,8 @@ def apply_icon(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    staged_repo: Path = STAGED_REPO_DIR,
+    win_app_dirs: list[Path] | None = None,
     save_active_config: bool = True,
     refresh_dock: bool = False,
     run_upstream_generator: bool = False,
@@ -794,6 +823,8 @@ def apply_icon(
             repo=repo,
             hermes_app=hermes_app,
             applications_app=applications_app,
+            staged_repo=staged_repo,
+            win_app_dirs=win_app_dirs,
             save_active_config=save_active_config,
             refresh_dock=refresh_dock,
             run_upstream_generator=run_upstream_generator,
@@ -806,6 +837,7 @@ def inspect_surfaces(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    win_app_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Fast (<20ms) surface check comparing live SHA-256 hashes against state & backup manifest."""
     state = load_state()
@@ -813,7 +845,7 @@ def inspect_surfaces(
     backup = load_backup_manifest() or {}
     original_files: dict[str, Any] = backup.get("files", {})
 
-    surfaces = _tracked_surface_paths(repo, hermes_app, applications_app)
+    surfaces = _tracked_surface_paths(repo, hermes_app, applications_app, win_app_dirs=win_app_dirs)
     drifted: list[dict[str, str]] = []
     restored_to_original: list[str] = []
     missing: list[str] = []
@@ -826,7 +858,7 @@ def inspect_surfaces(
         cur_hash = sha256_file(path)
         orig_hash = original_files.get(key, {}).get("sha256")
         exp_hash = expected.get(key)
-        if orig_hash and cur_hash == orig_hash:
+        if orig_hash and cur_hash == orig_hash and (not exp_hash or cur_hash != exp_hash):
             restored_to_original.append(key)
         if exp_hash and cur_hash != exp_hash:
             drifted.append({"surface": key, "expected": exp_hash, "actual": cur_hash})

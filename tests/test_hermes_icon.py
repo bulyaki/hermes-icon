@@ -28,6 +28,7 @@ from datetime import datetime, timedelta, timezone
 from PIL import Image, ImageDraw
 
 from hermes_icon.applier import (
+    _tracked_surface_paths,
     apply_icon,
     check_and_heal,
     inspect_surfaces,
@@ -36,7 +37,12 @@ from hermes_icon.applier import (
     replacer_lock,
 )
 from hermes_icon.asar import patch_asar, read_asar_header, verify_asar_integrity
-from hermes_icon.backup import ensure_original_backup, load_backup_manifest, sha256_file
+from hermes_icon.backup import (
+    ensure_original_backup,
+    load_backup_manifest,
+    restore_original_icons,
+    sha256_file,
+)
 from hermes_icon.config import (
     APPLICATIONS_HERMES_APP,
     BACKUPS_ORIGINAL_DIR,
@@ -44,14 +50,22 @@ from hermes_icon.config import (
     HERMES_APP,
     HERMES_REPO,
     IconConfig,
+    candidate_hermes_homes,
+    discover_packaged_payload_dirs,
     discover_windows_app_dirs,
     load_config,
     load_state,
+    resolve_hermes_home,
     save_state,
 )
 from hermes_icon.gui import start_gui_server
 from hermes_icon.presets import PRESET_ORDER, PRESETS, VIEWBOX, build_preset_svg, resolve_preset_id
-from hermes_icon.renderer import IconRenderer, _load_generate_icons_module, apply_to_repo
+from hermes_icon.renderer import (
+    DEFAULT_TARGETS,
+    IconRenderer,
+    _load_generate_icons_module,
+    apply_to_repo,
+)
 from hermes_icon.tui import LEFT_COL_WIDTH, render_tui_frame
 from hermes_icon.watcher import (
     WINDOWS_TASK_NAME,
@@ -386,16 +400,29 @@ class TestLockAndWatcherConfig(unittest.TestCase):
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.2")
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.3")
 
     def test_windows_task_scheduler_and_cmd_launcher(self) -> None:
         self.assertTrue(BIN_HERMES_ICON_CMD.is_file())
         cmd_text = BIN_HERMES_ICON_CMD.read_text(encoding="utf-8")
-        self.assertIn("hermes-icon 0.1.2", cmd_text)
+        self.assertIn("hermes-icon 0.1.3", cmd_text)
         self.assertIn("run.py", cmd_text)
+        self.assertIn("LOCALAPPDATA", cmd_text)
+        self.assertIn("agent-payload", cmd_text)
+        self.assertIn("WindowsApps", cmd_text)
 
         win_launcher = _launcher_bin(BIN_HERMES_ICON_CMD.parent, platform="win32")
         self.assertEqual(win_launcher, BIN_HERMES_ICON_CMD)
+
+        with tempfile.TemporaryDirectory(prefix="hermes-scoop-path-") as tmp:
+            scoop_root = Path(tmp) / "scoop" / "apps" / "hermes-icon"
+            ver_bin = scoop_root / "0.1.3" / "bin"
+            cur_bin = scoop_root / "current" / "bin"
+            ver_bin.mkdir(parents=True)
+            cur_bin.mkdir(parents=True)
+            (ver_bin / "hermes-icon.cmd").write_text("@echo off\n", encoding="utf-8")
+            (cur_bin / "hermes-icon.cmd").write_text("@echo off\n", encoding="utf-8")
+            self.assertEqual(_launcher_bin(ver_bin, platform="win32"), cur_bin / "hermes-icon.cmd")
 
         create_cmd = build_windows_schtasks_create_cmd(win_launcher)
         self.assertEqual(create_cmd[:4], ["schtasks", "/Create", "/TN", WINDOWS_TASK_NAME])
@@ -620,6 +647,262 @@ class TestLiveIntegrationAndSelfHealing(unittest.TestCase):
         hooks = git_hooks_status()
         self.assertTrue(all(hooks.values()), f"Missing git hooks: {hooks}")
         _ = elapsed_ms
+
+
+class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
+    def test_windows_hermes_home_resolution_and_packaged_discovery(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hermes-win-homes-") as tmp:
+            root = Path(tmp)
+            user_home = root / "Users" / "peter"
+            local_appdata = user_home / "AppData" / "Local"
+            program_files = root / "Program Files"
+            win_local_hermes = local_appdata / "hermes"
+            win_dot_hermes = user_home / ".hermes"
+            explicit_hermes = root / "custom-hermes"
+
+            # Default when neither exists: %LOCALAPPDATA%\hermes on win32, ~/.hermes on POSIX
+            env_base = {"LOCALAPPDATA": str(local_appdata), "ProgramFiles": str(program_files)}
+            self.assertEqual(
+                resolve_hermes_home(environ=env_base, home=user_home, platform="win32"),
+                win_local_hermes,
+            )
+            self.assertEqual(
+                resolve_hermes_home(environ=env_base, home=user_home, platform="darwin"),
+                win_dot_hermes,
+            )
+
+            # Candidate order: HERMES_HOME, %LOCALAPPDATA%\hermes, %USERPROFILE%\.hermes
+            self.assertEqual(
+                candidate_hermes_homes(
+                    environ={**env_base, "HERMES_HOME": str(explicit_hermes)},
+                    home=user_home,
+                    platform="win32",
+                ),
+                [explicit_hermes, win_local_hermes, win_dot_hermes],
+            )
+
+            # Falls back to ~/.hermes when only ~/.hermes exists
+            win_dot_hermes.mkdir(parents=True)
+            self.assertEqual(
+                resolve_hermes_home(environ=env_base, home=user_home, platform="win32"),
+                win_dot_hermes,
+            )
+
+            # Prefers %LOCALAPPDATA%\hermes when both exist
+            win_local_hermes.mkdir(parents=True)
+            self.assertEqual(
+                resolve_hermes_home(environ=env_base, home=user_home, platform="win32"),
+                win_local_hermes,
+            )
+
+            # Explicit HERMES_HOME wins when it exists
+            explicit_hermes.mkdir(parents=True)
+            self.assertEqual(
+                resolve_hermes_home(
+                    environ={**env_base, "HERMES_HOME": str(explicit_hermes)},
+                    home=user_home,
+                    platform="win32",
+                ),
+                explicit_hermes,
+            )
+
+            # Packaged app directories and agent-payload discovery
+            prog_hermes = local_appdata / "Programs" / "Hermes"
+            alt_hermes = local_appdata / "hermes-desktop"
+            pf_hermes = program_files / "Hermes"
+            winapps_payload = program_files / "WindowsApps" / "NousResearch.Hermes_1.0_x64" / "app" / "resources" / "agent-payload"
+            for app_dir in (prog_hermes, alt_hermes, pf_hermes):
+                (app_dir / "resources" / "agent-payload").mkdir(parents=True)
+                (app_dir / "Hermes.exe").write_bytes(b"MZ")
+            winapps_payload.mkdir(parents=True)
+
+            found_apps = discover_windows_app_dirs(
+                root / "missing-repo",
+                environ=env_base,
+                home=user_home,
+            )
+            self.assertEqual(found_apps, [prog_hermes, alt_hermes, pf_hermes])
+
+            found_payloads = discover_packaged_payload_dirs(
+                environ=env_base,
+                home=user_home,
+                platform="win32",
+            )
+            self.assertIn(prog_hermes / "resources" / "agent-payload", found_payloads)
+            self.assertIn(alt_hermes / "resources" / "agent-payload", found_payloads)
+            self.assertIn(pf_hermes / "resources" / "agent-payload", found_payloads)
+            self.assertIn(winapps_payload, found_payloads)
+
+    def test_packaged_only_install_without_repo_checkout(self) -> None:
+        gen_mod = _load_generate_icons_module()
+        if gen_mod is not None:
+            self.assertEqual(DEFAULT_TARGETS, list(gen_mod.TARGETS))
+        self.assertEqual(len(DEFAULT_TARGETS), 99)
+
+        asar_src = HERMES_APP / "Contents" / "Resources" / "app.asar"
+        if not asar_src.exists():
+            self.skipTest("Hermes.app app.asar not present")
+
+        with tempfile.TemporaryDirectory(prefix="hermes-packaged-only-") as tmp:
+            root = Path(tmp)
+            missing_repo = root / "no-hermes-agent"
+            state_dir = root / "state"
+            win_app = root / "LocalAppData" / "Programs" / "Hermes"
+            wres = win_app / "resources"
+            unpacked_dist = wres / "app.asar.unpacked" / "dist"
+            unpacked_dist.mkdir(parents=True)
+            (wres / "icon.ico").write_bytes(b"ORIG_ICO")
+            shutil.copy2(asar_src, wres / "app.asar")
+            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+                (unpacked_dist / fname).write_bytes(b"ORIG_PNG")
+
+            apps_icns = root / "Applications" / "Hermes.app" / "Contents" / "Resources" / "icon.icns"
+            apps_icns.parent.mkdir(parents=True)
+            apps_icns.write_bytes(b"ORIG_ICNS")
+
+            # _tracked_surface_paths must exclude repo/... when repo/assets does not exist
+            tracked = _tracked_surface_paths(
+                repo=missing_repo,
+                hermes_app=root / "missing-Hermes.app",
+                applications_app=root / "Applications" / "Hermes.app",
+                win_app_dirs=[win_app],
+            )
+            self.assertFalse(any(k.startswith("repo/") for k in tracked))
+            self.assertIn("win_app/Hermes/resources/icon.ico", tracked)
+            self.assertIn("applications_hermes_app/Contents/Resources/icon.icns", tracked)
+
+            # Run isolated apply + check + restore in subprocess with HERMES_ICON_STATE_DIR
+            env = {
+                **os.environ,
+                "HOME": str(root),
+                "LOCALAPPDATA": str(root / "LocalAppData"),
+                "HERMES_HOME": str(root / ".hermes"),
+                "HERMES_REPO": str(missing_repo),
+                "HERMES_ICON_STATE_DIR": str(state_dir),
+                "PYTHONPATH": str(SRC_DIR),
+            }
+            script = (
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "from hermes_icon.applier import apply_icon, inspect_surfaces\n"
+                "from hermes_icon.backup import restore_original_icons\n"
+                "from hermes_icon.config import IconConfig\n"
+                "repo = Path(sys.argv[1])\n"
+                "win_app = Path(sys.argv[2])\n"
+                "apps_app = Path(sys.argv[3])\n"
+                "missing_app = Path(sys.argv[4])\n"
+                "res = apply_icon(IconConfig(mode='preset', preset='shield'), repo=repo, hermes_app=missing_app, applications_app=apps_app, win_app_dirs=[win_app])\n"
+                "surf = inspect_surfaces(repo=repo, hermes_app=missing_app, applications_app=apps_app, win_app_dirs=[win_app])\n"
+                "rest = restore_original_icons(repo=repo, hermes_app=missing_app, applications_app=apps_app)\n"
+                "print(json.dumps({'res': res, 'surf': surf, 'rest': rest}))\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", script, str(missing_repo), str(win_app), str(root / "Applications" / "Hermes.app"), str(root / "missing-Hermes.app")],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            out = json.loads(proc.stdout)
+            self.assertTrue(out["res"]["repo"]["staged"])
+            self.assertEqual(out["res"]["repo"]["check_stdout"], "staged (no repo checkout)")
+            self.assertTrue((state_dir / "staged-repo" / "apps" / "desktop" / "assets" / "icon.ico").is_file())
+            self.assertTrue(out["res"]["applications_hermes_app_patched"])
+            self.assertEqual(len(out["res"]["windows_apps"]), 1)
+            self.assertTrue(out["res"]["windows_apps"][0]["patched"])
+            self.assertFalse(out["surf"]["needs_apply"])
+            self.assertEqual(out["surf"]["matching"], out["surf"]["total_surfaces"])
+            self.assertGreaterEqual(out["rest"]["restored_count"], 5)
+            self.assertEqual((wres / "icon.ico").read_bytes(), b"ORIG_ICO")
+            self.assertEqual(apps_icns.read_bytes(), b"ORIG_ICNS")
+
+    def test_run_py_bootstrap_and_site_packages_discovery(self) -> None:
+        run_py = Path(__file__).resolve().parent.parent / "run.py"
+        # 1. --bootstrap exits 0 cleanly with the active Python
+        r_ok = subprocess.run([sys.executable, "-I", str(run_py), "--bootstrap"], capture_output=True, text=True)
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+
+        # 2. When invoked by a bare Python lacking PIL/resvg_py, run.py discovers <REPLACER_ROOT>/site-packages
+        bare_py = shutil.which("python3")
+        if bare_py:
+            bare_probe = subprocess.run([bare_py, "-I", "-c", "import PIL, resvg_py"], capture_output=True)
+            if bare_probe.returncode != 0:
+                with tempfile.TemporaryDirectory(prefix="hermes-runpy-site-") as tmp:
+                    root = Path(tmp)
+                    state_dir = root / "state"
+                    site_dir = state_dir / "site-packages"
+                    (site_dir / "PIL").mkdir(parents=True)
+                    (site_dir / "PIL" / "__init__.py").write_text("# stub PIL\n", encoding="utf-8")
+                    (site_dir / "resvg_py.py").write_text("# stub resvg_py\n", encoding="utf-8")
+                    env = {
+                        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                        "HOME": str(root / "empty-home"),
+                        "HERMES_HOME": str(root / "empty-home" / ".hermes"),
+                        "HERMES_ICON_STATE_DIR": str(state_dir),
+                    }
+                    r_site = subprocess.run([bare_py, "-I", str(run_py), "--bootstrap"], capture_output=True, text=True, env=env)
+                    self.assertEqual(r_site.returncode, 0, f"stdout={r_site.stdout}\nstderr={r_site.stderr}")
+
+        # 3. Verify _bootstrap_deps Strategy A (uv) and Strategy B (venv+pip) and Strategy C (pip --target)
+        sys.path.insert(0, str(run_py.parent))
+        import importlib
+        run_mod = importlib.import_module("run")
+        with tempfile.TemporaryDirectory(prefix="hermes-bootstrap-unit-") as tmp:
+            root = Path(tmp)
+            state_uv = root / "state-uv"
+            fake_uv = root / "bin" / "uv"
+            fake_uv.parent.mkdir(parents=True)
+            fake_uv.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_uv.chmod(0o755)
+
+            orig_run = run_mod.subprocess.run
+            orig_probe = run_mod._probe_python
+            orig_find_uv = run_mod._find_uv_binary
+            calls: list[list[str]] = []
+
+            def _fake_probe(cand: Path, site_dir: Path | None = None) -> bool:
+                return cand == state_uv / ".venv" / ("Scripts" if sys.platform == "win32" else "bin") / ("python.exe" if sys.platform == "win32" else "python")
+
+            def _fake_run(cmd, **kwargs):
+                calls.append([str(c) for c in cmd])
+                if str(cmd[0]) == str(fake_uv) and cmd[1] == "venv":
+                    venv_py = state_uv / ".venv" / ("Scripts" if sys.platform == "win32" else "bin") / ("python.exe" if sys.platform == "win32" else "python")
+                    venv_py.parent.mkdir(parents=True, exist_ok=True)
+                    venv_py.write_text("#!/bin/sh\n", encoding="utf-8")
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+
+            try:
+                run_mod._find_uv_binary = lambda: fake_uv
+                run_mod._probe_python = _fake_probe
+                run_mod.subprocess.run = _fake_run
+                py_a, sp_a = run_mod._bootstrap_deps(state_uv)
+                self.assertIsNone(sp_a)
+                self.assertTrue(any("uv" in c[0] and "pip" in c and "pillow" in c and "resvg-py" in c for c in calls))
+
+                # Strategy B + C fallback when uv is absent and venv fails
+                calls.clear()
+                state_target = root / "state-target"
+                run_mod._find_uv_binary = lambda: None
+
+                def _fake_run_fallback(cmd, **kwargs):
+                    calls.append([str(c) for c in cmd])
+                    if len(cmd) >= 3 and cmd[1:3] == ["-m", "venv"]:
+                        return subprocess.CompletedProcess(cmd, 1, "", "no ensurepip")
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                def _fake_probe_target(cand: Path, site_dir: Path | None = None) -> bool:
+                    return site_dir == state_target / "site-packages"
+
+                run_mod.subprocess.run = _fake_run_fallback
+                run_mod._probe_python = _fake_probe_target
+                py_c, sp_c = run_mod._bootstrap_deps(state_target)
+                self.assertEqual(py_c, Path(sys.executable))
+                self.assertEqual(sp_c, state_target / "site-packages")
+                self.assertTrue(any("--target" in c and "pillow" in c and "resvg-py" in c for c in calls))
+            finally:
+                run_mod.subprocess.run = orig_run
+                run_mod._probe_python = orig_probe
+                run_mod._find_uv_binary = orig_find_uv
 
 
 if __name__ == "__main__":

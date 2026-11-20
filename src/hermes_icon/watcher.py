@@ -30,6 +30,13 @@ def _launcher_bin(bin_dir: Path | None = None, *, platform: str | None = None) -
     target_dir = bin_dir or BIN_DIR
     plat = platform or sys.platform
     if plat == "win32":
+        lower_parts = [p.lower() for p in target_dir.parts]
+        if "scoop" in lower_parts and "apps" in lower_parts:
+            idx = lower_parts.index("apps")
+            if idx + 1 < len(target_dir.parts):
+                scoop_current = Path(*target_dir.parts[: idx + 2]) / "current" / "bin" / "hermes-icon.cmd"
+                if scoop_current.exists():
+                    return scoop_current
         cmd = target_dir / "hermes-icon.cmd"
         if cmd.exists() or platform == "win32":
             return cmd

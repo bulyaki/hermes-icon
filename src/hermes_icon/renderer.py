@@ -28,6 +28,7 @@ from .config import (
     DEFAULT_FG_LIGHT,
     GENERATE_ICONS_PY,
     HERMES_REPO,
+    STAGED_REPO_DIR,
     IconConfig,
 )
 from .presets import ASSETS_DIR, PRESETS, VIEWBOX, build_preset_svg, resolve_preset_id
@@ -40,9 +41,124 @@ MAC_SQUIRCLE_RX = 185.4
 
 _PRESET_BBOX_CACHE: dict[str, tuple[float, float, float, float]] = {}
 
+# Fallback target list (matching scripts/generate_icons.py) when no Hermes checkout exists on disk.
+DEFAULT_TARGETS: list[tuple[str, str, Any]] = [
+    ("assets/icon-master.svg", "svg", None),
+    ("assets/icon-master-dark.svg", "svg_dark", None),
+    ("apps/desktop/assets/icon.png", "png", 1024),
+    ("apps/desktop/assets/icon.ico", "ico", [16, 24, 32, 48, 64, 128, 256]),
+    ("apps/desktop/assets/icon.icns", "icns", None),
+    ("apps/desktop/assets/icon-dark.png", "png_dark", 1024),
+    ("apps/desktop/assets/icon-dark.ico", "ico_dark", [16, 24, 32, 48, 64, 128, 256]),
+    ("apps/desktop/assets/icon-dark.icns", "icns_dark", None),
+    ("apps/desktop/packaging/dmg-volume.icns", "icns_from_png", "assets/dmg-volume.png"),
+    ("apps/desktop/assets/icon.icon/icon.json", "icon_manifest", None),
+    ("apps/desktop/assets/icon.icon/Assets/art-light.png", "icon_art", "black"),
+    ("apps/desktop/assets/icon.icon/Assets/art-dark.png", "icon_art", "white"),
+    ("apps/desktop/assets/icon.icon/Assets/mono.png", "icon_mono", None),
+    ("apps/desktop/assets/appx/Square44x44Logo.png", "png", 44),
+    ("apps/desktop/assets/appx/Square44x44Logo.scale-125.png", "png", 55),
+    ("apps/desktop/assets/appx/Square44x44Logo.scale-150.png", "png", 66),
+    ("apps/desktop/assets/appx/Square44x44Logo.scale-200.png", "png", 88),
+    ("apps/desktop/assets/appx/Square44x44Logo.scale-400.png", "png", 176),
+    ("apps/desktop/assets/appx/Square150x150Logo.png", "png", 150),
+    ("apps/desktop/assets/appx/Square150x150Logo.scale-125.png", "png", 188),
+    ("apps/desktop/assets/appx/Square150x150Logo.scale-150.png", "png", 225),
+    ("apps/desktop/assets/appx/Square150x150Logo.scale-200.png", "png", 300),
+    ("apps/desktop/assets/appx/Square150x150Logo.scale-400.png", "png", 600),
+    ("apps/desktop/assets/appx/StoreLogo.png", "png", 50),
+    ("apps/desktop/assets/appx/StoreLogo.scale-125.png", "png", 63),
+    ("apps/desktop/assets/appx/StoreLogo.scale-150.png", "png", 75),
+    ("apps/desktop/assets/appx/StoreLogo.scale-200.png", "png", 100),
+    ("apps/desktop/assets/appx/StoreLogo.scale-400.png", "png", 200),
+    ("apps/desktop/assets/appx/Wide310x150Logo.png", "wide", (310, 150, 100)),
+    ("apps/desktop/assets/appx/Wide310x150Logo.scale-125.png", "wide", (388, 188, 125)),
+    ("apps/desktop/assets/appx/Wide310x150Logo.scale-150.png", "wide", (465, 225, 150)),
+    ("apps/desktop/assets/appx/Wide310x150Logo.scale-200.png", "wide", (620, 300, 200)),
+    ("apps/desktop/assets/appx/Wide310x150Logo.scale-400.png", "wide", (1240, 600, 400)),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-16.png", "png", 16),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-16_altform-unplated.png", "png_dark", 16),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-16_altform-lightunplated.png", "png", 16),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-20.png", "png", 20),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-20_altform-unplated.png", "png_dark", 20),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-20_altform-lightunplated.png", "png", 20),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-24.png", "png", 24),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-24_altform-unplated.png", "png_dark", 24),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-24_altform-lightunplated.png", "png", 24),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-30.png", "png", 30),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-30_altform-unplated.png", "png_dark", 30),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-30_altform-lightunplated.png", "png", 30),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-32.png", "png", 32),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-32_altform-unplated.png", "png_dark", 32),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-32_altform-lightunplated.png", "png", 32),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-36.png", "png", 36),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-36_altform-unplated.png", "png_dark", 36),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-36_altform-lightunplated.png", "png", 36),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-40.png", "png", 40),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-40_altform-unplated.png", "png_dark", 40),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-40_altform-lightunplated.png", "png", 40),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-48.png", "png", 48),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-48_altform-unplated.png", "png_dark", 48),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-48_altform-lightunplated.png", "png", 48),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-60.png", "png", 60),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-60_altform-unplated.png", "png_dark", 60),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-60_altform-lightunplated.png", "png", 60),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-64.png", "png", 64),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-64_altform-unplated.png", "png_dark", 64),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-64_altform-lightunplated.png", "png", 64),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-72.png", "png", 72),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-72_altform-unplated.png", "png_dark", 72),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-72_altform-lightunplated.png", "png", 72),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-80.png", "png", 80),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-80_altform-unplated.png", "png_dark", 80),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-80_altform-lightunplated.png", "png", 80),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-96.png", "png", 96),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-96_altform-unplated.png", "png_dark", 96),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-96_altform-lightunplated.png", "png", 96),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-256.png", "png", 256),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-256_altform-unplated.png", "png_dark", 256),
+    ("apps/desktop/assets/appx/Square44x44Logo.targetsize-256_altform-lightunplated.png", "png", 256),
+    ("apps/desktop/public/apple-touch-icon.png", "png", 1024),
+    ("apps/desktop/assets/icon-mac.png", "png_mac", 1024),
+    ("apps/desktop/public/nous-girl.png", "girl_light", 256),
+    ("apps/desktop/public/nous-girl-dark.png", "girl_dark", 256),
+    ("apps/bootstrap-installer/src-tauri/icons/32x32.png", "png", 32),
+    ("apps/bootstrap-installer/src-tauri/icons/128x128.png", "png", 128),
+    ("apps/bootstrap-installer/src-tauri/icons/128x128@2x.png", "png", 256),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.ico", "ico", [16, 32, 64, 128, 256]),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.icns", "icns", None),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.icon/icon.json", "icon_manifest", None),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.icon/Assets/art-light.png", "icon_art", "black"),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.icon/Assets/art-dark.png", "icon_art", "white"),
+    ("apps/bootstrap-installer/src-tauri/icons/icon.icon/Assets/mono.png", "icon_mono", None),
+    ("apps/bootstrap-installer/public/nous-girl.png", "girl_light", 256),
+    ("website/static/img/logo.png", "logo", None),
+    ("website/static/img/logo-dark.png", "logo_dark", None),
+    ("website/static/img/nous-logo.png", "png_white", 150),
+    ("website/static/img/nous-logo-dark.png", "png_dark_white", 150),
+    ("website/static/img/favicon-16x16.png", "png", 16),
+    ("website/static/img/favicon-32x32.png", "png", 32),
+    ("website/static/img/apple-touch-icon.png", "png", 180),
+    ("website/static/img/favicon.ico", "ico", [16, 32, 48]),
+    ("website/static/img/favicon.svg", "svg_copy", None),
+    ("web/public/favicon.ico", "ico", [16, 32, 48]),
+]
 
-def _load_generate_icons_module():
-    spec = importlib.util.spec_from_file_location("_hermes_generate_icons", str(GENERATE_ICONS_PY))
+
+def _resolve_generate_icons_py(repo: Path = HERMES_REPO) -> Path | None:
+    cand = repo / "scripts" / "generate_icons.py"
+    if cand.is_file():
+        return cand
+    if repo == HERMES_REPO and GENERATE_ICONS_PY.is_file():
+        return GENERATE_ICONS_PY
+    return None
+
+
+def _load_generate_icons_module(repo: Path = HERMES_REPO):
+    gen_py = _resolve_generate_icons_py(repo)
+    if gen_py is None:
+        return None
+    spec = importlib.util.spec_from_file_location("_hermes_generate_icons", str(gen_py))
     assert spec and spec.loader
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -680,21 +796,31 @@ def apply_to_repo(
     cfg: IconConfig,
     repo: Path = HERMES_REPO,
     *,
+    staged_repo: Path = STAGED_REPO_DIR,
     run_upstream_generator: bool = False,
     run_upstream_check: bool = False,
 ) -> dict[str, Any]:
-    """Write source SVGs, render clean centered targets, and optionally run generate_icons.py."""
+    """Write source SVGs, render clean centered targets, and optionally run generate_icons.py.
+
+    When ``repo`` does not contain a Hermes checkout (e.g. standalone packaged desktop app
+    installs), targets are staged under ``staged_repo`` (``REPLACER_ROOT / "staged-repo"``).
+    """
     renderer = IconRenderer(cfg)
-    assets_dir = repo / "assets"
+    has_repo = (repo / "assets").is_dir()
+    target_repo = repo if has_repo else staged_repo
+    assets_dir = target_repo / "assets"
+    assets_dir.mkdir(parents=True, exist_ok=True)
     black_svg, white_svg = renderer.source_svgs()
     (assets_dir / "nous-girl-black.svg").write_text(black_svg, encoding="utf-8")
     (assets_dir / "nous-girl-white.svg").write_text(white_svg, encoding="utf-8")
 
+    gen_py = _resolve_generate_icons_py(repo) if has_repo else None
+
     # Optional upstream generate_icons.py run (skipped by default for fast interactive apply)
-    if run_upstream_generator:
+    if run_upstream_generator and gen_py is not None:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
         proc = subprocess.run(
-            [sys.executable, "-I", str(GENERATE_ICONS_PY), "--source", str(repo), "--out", str(repo)],
+            [sys.executable, "-I", str(gen_py), "--source", str(repo), "--out", str(repo)],
             capture_output=True,
             text=True,
             env=env,
@@ -705,28 +831,29 @@ def apply_to_repo(
             )
 
     # Render clean, undistorted, centered versions of all 99 targets
-    gen_mod = _load_generate_icons_module()
+    gen_mod = _load_generate_icons_module(repo) if has_repo else None
+    targets = list(gen_mod.TARGETS) if gen_mod is not None else DEFAULT_TARGETS
     written = 0
-    for rel, kind, arg in gen_mod.TARGETS:
-        out_path = repo / rel
+    for rel, kind, arg in targets:
+        out_path = target_repo / rel
         if kind == "icns_from_png":
             # dmg-volume.icns uses assets/dmg-volume.png (unchanged); skip re-encoding if already valid
             if out_path.exists() and out_path.stat().st_size > 0:
                 written += 1
                 continue
-            dmg_src = repo / str(arg)
+            dmg_src = target_repo / str(arg)
             if not dmg_src.exists():
                 continue
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        data = renderer.render_target_bytes(rel, kind, arg, repo / "assets" / "dmg-volume.png")
+        data = renderer.render_target_bytes(rel, kind, arg, target_repo / "assets" / "dmg-volume.png")
         out_path.write_bytes(data)
         written += 1
 
-    check_stdout = "skipped (fast apply)"
-    if run_upstream_check:
+    check_stdout = "staged (no repo checkout)" if not has_repo else "skipped (fast apply)"
+    if run_upstream_check and gen_py is not None:
         env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
         check_proc = subprocess.run(
-            [sys.executable, "-I", str(GENERATE_ICONS_PY), "--check", "--source", str(repo), "--out", str(repo)],
+            [sys.executable, "-I", str(gen_py), "--check", "--source", str(repo), "--out", str(repo)],
             capture_output=True,
             text=True,
             env=env,
@@ -741,4 +868,6 @@ def apply_to_repo(
     return {
         "targets_written": written,
         "check_stdout": check_stdout,
+        "staged": not has_repo,
+        "output_repo": str(target_repo),
     }

@@ -41,6 +41,7 @@ def _backup_targets(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    win_app_dirs: list[Path] | None = None,
 ) -> list[tuple[str, Path]]:
     """Return ``(backup_relpath, live_path)`` pairs to preserve on first run."""
     items: list[tuple[str, Path]] = [
@@ -74,9 +75,15 @@ def _backup_targets(
         app_icns = applications_app / "Contents" / "Resources" / "icon.icns"
         if app_icns.exists():
             items.append(("applications_hermes_app/Contents/Resources/icon.icns", app_icns))
-    for wdir in discover_windows_app_dirs(repo):
+    resolved_win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
+    win_name_counts: dict[str, int] = {}
+    for wdir in resolved_win_dirs:
+        win_name_counts[wdir.name] = win_name_counts.get(wdir.name, 0) + 1
+
+    for wdir in resolved_win_dirs:
         wres = wdir / "resources"
-        prefix = f"win_app/{wdir.name}/resources"
+        label = f"{wdir.parent.name}/{wdir.name}" if win_name_counts.get(wdir.name, 0) > 1 else wdir.name
+        prefix = f"win_app/{label}/resources"
         for sub, p in (
             ("icon.ico", wres / "icon.ico"),
             ("app.asar", wres / "app.asar"),
@@ -94,6 +101,7 @@ def ensure_original_backup(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    win_app_dirs: list[Path] | None = None,
 ) -> dict[str, Any]:
     """Create the original backup once and never overwrite an existing backup."""
     manifest_path = backup_dir / "manifest.json"
@@ -102,7 +110,7 @@ def ensure_original_backup(
 
     backup_dir.mkdir(parents=True, exist_ok=True)
     files_meta: dict[str, dict[str, Any]] = {}
-    for rel, src in _backup_targets(repo, hermes_app, applications_app):
+    for rel, src in _backup_targets(repo, hermes_app, applications_app, win_app_dirs=win_app_dirs):
         if not src.exists():
             continue
         dst = backup_dir / rel
@@ -143,25 +151,29 @@ def restore_original_icons(
         raise FileNotFoundError(f"Original backup manifest not found at {backup_dir / 'manifest.json'}")
 
     restored: list[str] = []
-    # 1. Restore nous-girl SVGs first and regenerate all 99 repo targets
-    for rel in ("repo/assets/nous-girl-black.svg", "repo/assets/nous-girl-white.svg"):
-        src = backup_dir / rel
-        if src.exists():
-            dst = repo / rel.removeprefix("repo/")
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
-            restored.append(str(dst))
+    # 1. Restore nous-girl SVGs first and regenerate all 99 repo targets when a repo exists
+    if (repo / "assets").is_dir():
+        for rel in ("repo/assets/nous-girl-black.svg", "repo/assets/nous-girl-white.svg"):
+            src = backup_dir / rel
+            if src.exists():
+                dst = repo / rel.removeprefix("repo/")
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                restored.append(str(dst))
 
-    env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
-    import sys
-    proc = subprocess.run(
-        [sys.executable, "-I", str(GENERATE_ICONS_PY), "--source", str(repo), "--out", str(repo)],
-        capture_output=True,
-        text=True,
-        env=env,
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(f"generate_icons.py restore failed: {proc.stdout}\n{proc.stderr}")
+        gen_py = repo / "scripts" / "generate_icons.py"
+        if not gen_py.is_file() and repo == HERMES_REPO and GENERATE_ICONS_PY.is_file():
+            gen_py = GENERATE_ICONS_PY
+        if gen_py.is_file():
+            env = {k: v for k, v in os.environ.items() if k not in ("PYTHONPATH", "PYTHONHOME")}
+            proc = subprocess.run(
+                [sys.executable, "-I", str(gen_py), "--source", str(repo), "--out", str(repo)],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"generate_icons.py restore failed: {proc.stdout}\n{proc.stderr}")
 
     # 2. Restore exact backed-up files (web_dist, Hermes.app, /Applications/Hermes.app)
     for rel, meta in manifest.get("files", {}).items():

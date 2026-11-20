@@ -11,10 +11,10 @@ A cross-platform utility to customize the Hermes desktop application icon across
   - **Interactive Terminal Picker (TUI)** (`hermes-icon pick` or `hermes-icon` in a TTY) with live 24-bit color half-block previews and native file dialog (`f` via Finder on macOS or Explorer on Windows)
   - **Local Web GUI** (`hermes-icon gui`) with live light/dark squircle previews, drag-and-drop upload, color pickers, scale slider, and one-click Apply & Watch
 - **Full Surface Replacement**:
-  - Regenerates all 99 targets in `~/.hermes/hermes-agent` (`nous-girl-{black,white}.svg` compatible with `generate_icons.py --check`, PNG/ICO/ICNS/MSIX/Icon Composer assets)
-  - Updates `~/.hermes/hermes-agent/hermes_cli/web_dist/favicon.ico`
+  - Regenerates all 99 targets in your `hermes-agent` repository (`nous-girl-{black,white}.svg` compatible with `generate_icons.py --check`, PNG/ICO/ICNS/MSIX/Icon Composer assets), or stages targets under `icon-replacer/staged-repo` for standalone packaged desktop installs without a source checkout
+  - Updates `hermes_cli/web_dist/favicon.ico` when present
   - **macOS**: Compiles macOS 26 `Assets.car` via `/usr/bin/actool`, replaces `icon.icns` / `icon.ico` / `app.asar.unpacked/dist/*`, patches `app.asar` & `Info.plist` (`ElectronAsarIntegrity`), re-signs `Hermes.app` with `/usr/bin/codesign`, and patches `/Applications/Hermes.app/Contents/Resources/icon.icns` when present and writable
-  - **Windows**: Patches `win-unpacked` / `win-arm64-unpacked` / `win-ia32-unpacked` and `%LOCALAPPDATA%\Programs\Hermes` (`resources/icon.ico`, `resources/app.asar`, `resources/app.asar.unpacked/dist/*`) and refreshes the Windows icon cache & Start Menu/Desktop `.lnk` shortcuts
+  - **Windows**: Patches `win-unpacked` / `win-arm64-unpacked` / `win-ia32-unpacked`, `%LOCALAPPDATA%\Programs\Hermes`, `%LOCALAPPDATA%\hermes-desktop`, and `%ProgramFiles%\Hermes` (`resources/icon.ico`, `resources/app.asar`, `resources/app.asar.unpacked/dist/*`) and refreshes the Windows icon cache & Start Menu/Desktop `.lnk` shortcuts
 - **Automatic Update Recovery**:
   - **macOS**: Installs a `launchd` agent (`WatchPaths` + 60s fingerprint check) and Git hooks (`post-merge`, `post-checkout`, `post-rewrite`)
   - **Windows**: Registers a `HermesIconReplacer` Task Scheduler job (60s check) and Git hooks so updates that restore the default icon re-apply your chosen icon automatically
@@ -24,7 +24,7 @@ A cross-platform utility to customize the Hermes desktop application icon across
 ## Requirements
 
 - **macOS** (tested on Apple Silicon with Xcode / `actool` and `codesign`), **Windows 10/11**, or **Linux**
-- Python 3.11+ with `Pillow` and `resvg_py` (automatically resolved from your Hermes installation under `~/.hermes/installs/` via `facts.json` when present, or installed directly via `uv`)
+- Python 3.11+ (`Pillow` and `resvg-py` are resolved automatically from your Hermes installation or bootstrapped automatically into `$HERMES_HOME/icon-replacer/.venv` on first run / `hermes-icon --bootstrap`)
 
 ## Installation
 
@@ -127,10 +127,10 @@ hermes-icon restore
 
 ## Runtime State & Environment Variables
 
-Runtime configuration, backups, lockfiles, and logs are kept outside the source checkout in `~/.hermes/icon-replacer/` (override with `HERMES_ICON_STATE_DIR`):
+Runtime configuration, backups, lockfiles, and logs are kept outside the source checkout in `%LOCALAPPDATA%\hermes\icon-replacer\` on Windows or `~/.hermes/icon-replacer/` on macOS/Linux (override with `HERMES_ICON_STATE_DIR`):
 
-- `HERMES_HOME`: Base Hermes directory (default: `~/.hermes`)
-- `HERMES_REPO`: Hermes repository path (default: `$HERMES_HOME/hermes-agent`)
+- `HERMES_HOME`: Base Hermes directory (default on Windows: `%LOCALAPPDATA%\hermes`, falling back to `%USERPROFILE%\.hermes` if present; default on macOS/Linux: `~/.hermes`)
+- `HERMES_REPO`: Hermes repository path (default: `$HERMES_HOME/hermes-agent` or packaged `agent-payload/repo` when present)
 - `HERMES_ICON_STATE_DIR`: Runtime state directory (default: `$HERMES_HOME/icon-replacer`)
 - `HERMES_PYTHON`: Optional explicit Python interpreter path override
 

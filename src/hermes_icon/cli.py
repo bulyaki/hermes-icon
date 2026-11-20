@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -215,6 +217,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Replace the Hermes app nous-girl icon across all surfaces.",
     )
     parser.add_argument("-V", "--version", action="version", version=f"hermes-icon {__version__}")
+    parser.add_argument(
+        "--bootstrap",
+        action="store_true",
+        help="Ensure runtime dependencies are installed and exit",
+    )
 
     sub = parser.add_subparsers(dest="command")
 
@@ -273,9 +280,26 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _init_windows_console() -> None:
+    if sys.platform == "win32":
+        os.system("")
+        with contextlib.suppress(Exception):
+            import ctypes
+
+            ctypes.windll.kernel32.SetConsoleOutputCP(65001)
+            ctypes.windll.kernel32.SetConsoleCP(65001)
+        for _stream in (sys.stdout, sys.stderr):
+            if hasattr(_stream, "reconfigure"):
+                with contextlib.suppress(Exception):
+                    _stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def main(argv: list[str] | None = None) -> int:
+    _init_windows_console()
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.bootstrap:
+        return 0
     if args.command is None:
         if sys.stdin.isatty() and sys.stdout.isatty():
             from .tui import run_tui
