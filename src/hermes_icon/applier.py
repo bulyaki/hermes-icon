@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import fcntl
 import json
 import os
 import shutil
@@ -16,6 +15,12 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+if sys.platform != "win32":
+    import fcntl
+else:
+    import msvcrt  # type: ignore[import-not-found]
+    fcntl = None  # type: ignore[assignment]
 
 from .asar import patch_asar, read_asar_header, verify_asar_integrity
 from .backup import ensure_original_backup, load_backup_manifest, sha256_file
@@ -30,6 +35,7 @@ from .config import (
     LOGS_DIR,
     REPLACER_LOCK_PATH,
     IconConfig,
+    discover_windows_app_dirs,
     ensure_dirs,
     load_config,
     load_state,
@@ -66,12 +72,43 @@ def _read_lock_holder(lock_path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _terminate_pid_tree(pid: int) -> None:
-    if pid <= 1 or pid == os.getpid():
-        return
+def _is_pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            return str(pid) in res.stdout
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
+        return True
     except OSError:
+        return False
+
+
+def _terminate_pid_tree(pid: int) -> None:
+    if pid <= 1 or pid == os.getpid() or not _is_pid_alive(pid):
+        return
+
+    if sys.platform == "win32":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+        except Exception:
+            pass
         return
 
     # Terminate any children (such as actool / ibtoold) first, then the holder
@@ -92,11 +129,29 @@ def _terminate_pid_tree(pid: int) -> None:
             return
         deadline = time.monotonic() + (0.45 if sig == signal.SIGTERM else 0.25)
         while time.monotonic() < deadline:
-            try:
-                os.kill(pid, 0)
-            except OSError:
+            if not _is_pid_alive(pid):
                 return
             time.sleep(0.05)
+
+
+def _flock_nb(fd: int) -> None:
+    if sys.platform == "win32":
+        # Ensure at least 1 byte exists for msvcrt.locking
+        if os.fstat(fd).st_size == 0:
+            os.lseek(fd, 0, os.SEEK_SET)
+            os.write(fd, b" ")
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _funlock(fd: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 @contextlib.contextmanager
@@ -111,12 +166,13 @@ def replacer_lock(
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
     acquired = False
+    busy_errnos = (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _flock_nb(fd)
             acquired = True
         except OSError as exc:
-            if exc.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+            if exc.errno not in busy_errnos:
                 raise
             if not blocking:
                 raise LockBusyError("replacer.lock is busy") from exc
@@ -135,29 +191,31 @@ def replacer_lock(
             deadline = time.monotonic() + timeout
             while True:
                 try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    _flock_nb(fd)
                     acquired = True
                     break
                 except OSError as exc2:
-                    if exc2.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                    if exc2.errno not in busy_errnos:
                         raise
                     if time.monotonic() >= deadline:
                         raise LockBusyError("Timed out waiting for replacer.lock") from exc2
                     time.sleep(0.05)
 
         meta = json.dumps({"pid": os.getpid(), "mode": mode, "ts": time.time()}).encode("utf-8")
-        os.ftruncate(fd, 0)
+        if sys.platform != "win32":
+            os.ftruncate(fd, 0)
         os.lseek(fd, 0, os.SEEK_SET)
         os.write(fd, meta)
         yield
     finally:
         if acquired:
+            if sys.platform != "win32":
+                try:
+                    os.ftruncate(fd, 0)
+                except OSError:
+                    pass
             try:
-                os.ftruncate(fd, 0)
-            except OSError:
-                pass
-            try:
-                fcntl.flock(fd, fcntl.LOCK_UN)
+                _funlock(fd)
             except OSError:
                 pass
         os.close(fd)
@@ -174,6 +232,24 @@ def is_update_in_progress() -> tuple[bool, str | None]:
                     return True, f"Recent update lock {lock_file.name} (age {int(age)}s)"
             except OSError:
                 pass
+
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=3,
+            )
+            if res.returncode == 0:
+                lower = res.stdout.lower()
+                for proc_hint in ("electron-builder", "hermes-update"):
+                    if proc_hint in lower:
+                        return True, f"Active Windows process matching {proc_hint!r}"
+        except Exception:
+            pass
+        return False, None
 
     for pattern in (r"hermes(\s+|-cli\s+)update", r"electron-builder", r"/usr/bin/actool"):
         try:
@@ -223,6 +299,7 @@ def _tracked_surface_paths(
     repo: Path = HERMES_REPO,
     hermes_app: Path = HERMES_APP,
     applications_app: Path = APPLICATIONS_HERMES_APP,
+    win_app_dirs: list[Path] | None = None,
 ) -> dict[str, Path]:
     surfaces: dict[str, Path] = {
         "repo/assets/nous-girl-black.svg": repo / "assets" / "nous-girl-black.svg",
@@ -259,6 +336,21 @@ def _tracked_surface_paths(
         icns = applications_app / "Contents" / "Resources" / "icon.icns"
         if icns.exists() and os.access(icns, os.W_OK):
             surfaces["applications_hermes_app/Contents/Resources/icon.icns"] = icns
+
+    for wdir in (win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)):
+        wres = wdir / "resources"
+        if not wres.is_dir():
+            continue
+        prefix = f"win_app/{wdir.name}/resources"
+        for rel, path in (
+            (f"{prefix}/icon.ico", wres / "icon.ico"),
+            (f"{prefix}/app.asar", wres / "app.asar"),
+            (f"{prefix}/app.asar.unpacked/dist/apple-touch-icon.png", wres / "app.asar.unpacked" / "dist" / "apple-touch-icon.png"),
+            (f"{prefix}/app.asar.unpacked/dist/nous-girl.png", wres / "app.asar.unpacked" / "dist" / "nous-girl.png"),
+            (f"{prefix}/app.asar.unpacked/dist/nous-girl-dark.png", wres / "app.asar.unpacked" / "dist" / "nous-girl-dark.png"),
+        ):
+            if path.exists():
+                surfaces[rel] = path
     return surfaces
 
 
@@ -276,6 +368,8 @@ def compute_surface_hashes(
 
 def _compile_assets_car(icon_icon_dir: Path, out_assets_car: Path) -> bool:
     """Compile Icon Composer package to Assets.car without pipe inheritance hangs."""
+    if sys.platform != "darwin" or not Path("/usr/bin/actool").exists():
+        return False
     with tempfile.TemporaryDirectory(prefix="hermes-actool-") as tmp:
         tmp_path = Path(tmp)
         partial_plist = tmp_path / "partial.plist"
@@ -383,6 +477,8 @@ def _collect_asar_replacements(repo: Path, asar_path: Path) -> dict[str, bytes]:
 
 
 def _codesign_hermes_app(hermes_app: Path, entitlements: Path = ENTITLEMENTS_PLIST) -> None:
+    if sys.platform != "darwin" or not Path("/usr/bin/codesign").exists():
+        return
     cmd = ["/usr/bin/codesign", "--force", "--sign", "-", "--options", "runtime"]
     if entitlements.exists():
         cmd.extend(["--entitlements", str(entitlements)])
@@ -407,6 +503,8 @@ def refresh_macos_icon_cache(
     refresh_dock: bool = False,
 ) -> None:
     """Notify macOS Workspace/Finder that app bundle icons changed."""
+    if sys.platform != "darwin":
+        return
     existing = [p for p in paths if p.exists()]
     for p in existing:
         try:
@@ -441,6 +539,84 @@ def refresh_macos_icon_cache(
                 )
             except Exception:
                 pass
+
+
+def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
+    """Patch an unpacked Windows Electron directory (resources/icon.ico, app.asar, unpacked dist)."""
+    res_dir = win_app_dir / "resources"
+    if not res_dir.is_dir():
+        return {"path": str(win_app_dir), "patched": False}
+
+    desktop_assets = repo / "apps" / "desktop" / "assets"
+    desktop_public = repo / "apps" / "desktop" / "public"
+    ico_src = desktop_assets / "icon.ico"
+    if ico_src.exists():
+        shutil.copy2(ico_src, res_dir / "icon.ico")
+
+    unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
+    if unpacked_dist.exists():
+        for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+            src_png = desktop_public / fname
+            if src_png.exists():
+                shutil.copy2(src_png, unpacked_dist / fname)
+
+    asar_res: dict[str, Any] | None = None
+    asar_path = res_dir / "app.asar"
+    if asar_path.exists():
+        replacements = _collect_asar_replacements(repo, asar_path)
+        asar_res = patch_asar(asar_path, replacements, info_plist_path=None)
+        ok, errs = verify_asar_integrity(
+            asar_path,
+            None,
+            unpacked_dir=res_dir / "app.asar.unpacked",
+            check_paths=list(replacements.keys()),
+        )
+        if not ok:
+            raise RuntimeError(f"Windows ASAR verification failed after patching {win_app_dir}: {errs}")
+
+    return {"path": str(win_app_dir), "patched": True, "asar": asar_res}
+
+
+def refresh_windows_icon_cache(icon_ico_path: Path) -> None:
+    """Refresh Windows icon cache and update Hermes.lnk shortcuts if present."""
+    if sys.platform != "win32":
+        return
+    try:
+        subprocess.run(
+            ["ie4uinit.exe", "-show"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+    if not icon_ico_path.exists():
+        return
+    ico_str = str(icon_ico_path).replace("'", "''")
+    ps_script = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$roots = @([Environment]::GetFolderPath('Desktop'), "
+        "Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'); "
+        "foreach ($r in $roots) { "
+        "if (Test-Path $r) { "
+        "Get-ChildItem -Path $r -Filter '*Hermes*.lnk' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { "
+        "$sc = $ws.CreateShortcut($_.FullName); "
+        f"$sc.IconLocation = '{ico_str},0'; "
+        "$sc.Save() "
+        "} } }"
+    )
+    try:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 
 def _cache_custom_files(cfg: IconConfig) -> IconConfig:
@@ -560,10 +736,19 @@ def _apply_icon_locked(
         shutil.copy2(repo / "apps" / "desktop" / "assets" / "icon.icns", apps_icns)
         apps_patched = True
 
+    # 4b. Windows unpacked Electron app dirs (if present)
+    win_dirs = discover_windows_app_dirs(repo)
+    win_results = [patch_windows_app_dir(wdir, repo) for wdir in win_dirs]
+
+    # 5. Refresh OS icon caches
     refresh_paths = [hermes_app]
     if apps_patched:
         refresh_paths.append(applications_app)
     refresh_macos_icon_cache(refresh_paths, refresh_dock=refresh_dock)
+    if win_results:
+        refresh_windows_icon_cache(repo / "apps" / "desktop" / "assets" / "icon.ico")
+    elif sys.platform == "win32":
+        refresh_windows_icon_cache(repo / "apps" / "desktop" / "assets" / "icon.ico")
 
     if save_active_config:
         cfg.watch_paused = False
@@ -583,6 +768,7 @@ def _apply_icon_locked(
     return {
         "repo": repo_res,
         "hermes_app": app_res,
+        "windows_apps": win_results,
         "applications_hermes_app_patched": apps_patched,
         "surfaces_tracked": len(hashes),
     }

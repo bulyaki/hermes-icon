@@ -1,4 +1,4 @@
-"""launchd background watcher and git hook management."""
+"""Cross-platform background watcher (launchd on macOS, Task Scheduler on Windows) and git hooks."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import plistlib
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -22,10 +23,17 @@ from .config import (
 HOOK_NAMES = ("post-merge", "post-checkout", "post-rewrite")
 HOOK_BEGIN = "# BEGIN hermes-icon-replacer"
 HOOK_END = "# END hermes-icon-replacer"
+WINDOWS_TASK_NAME = "HermesIconReplacer"
 
 
-def _launcher_bin(bin_dir: Path | None = None) -> Path:
+def _launcher_bin(bin_dir: Path | None = None, *, platform: str | None = None) -> Path:
     target_dir = bin_dir or BIN_DIR
+    plat = platform or sys.platform
+    if plat == "win32":
+        cmd = target_dir / "hermes-icon.cmd"
+        if cmd.exists() or platform == "win32":
+            return cmd
+
     parts = target_dir.parts
     if "Cellar" in parts:
         idx = parts.index("Cellar")
@@ -39,6 +47,15 @@ def _launcher_bin(bin_dir: Path | None = None) -> Path:
 
 
 def _hook_snippet() -> str:
+    if sys.platform == "win32":
+        bin_cmd = str(_launcher_bin(platform="win32")).replace("\\", "/")
+        return (
+            f"{HOOK_BEGIN}\n"
+            f'if [ -f "{bin_cmd}" ]; then\n'
+            f'  cmd.exe //c "{bin_cmd}" check --apply --delay 3 >/dev/null 2>&1 &\n'
+            f"fi\n"
+            f"{HOOK_END}\n"
+        )
     bin_path = _launcher_bin()
     return (
         f"{HOOK_BEGIN}\n"
@@ -70,11 +87,38 @@ def build_launchd_plist() -> dict[str, Any]:
     }
 
 
+def build_windows_schtasks_create_cmd(launcher: Path | None = None) -> list[str]:
+    bin_path = launcher or _launcher_bin(platform="win32")
+    return [
+        "schtasks",
+        "/Create",
+        "/TN",
+        WINDOWS_TASK_NAME,
+        "/TR",
+        f'"{bin_path}" check --apply',
+        "/SC",
+        "MINUTE",
+        "/MO",
+        "1",
+        "/F",
+    ]
+
+
+def build_windows_schtasks_query_cmd() -> list[str]:
+    return ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME]
+
+
+def build_windows_schtasks_delete_cmd() -> list[str]:
+    return ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"]
+
+
 def _uid() -> int:
-    return os.getuid()
+    return os.getuid() if hasattr(os, "getuid") else 0
 
 
 def is_launchd_loaded() -> bool:
+    if sys.platform != "darwin":
+        return False
     proc = subprocess.run(
         ["/bin/launchctl", "print", f"gui/{_uid()}/{LAUNCHD_LABEL}"],
         capture_output=True,
@@ -83,8 +127,22 @@ def is_launchd_loaded() -> bool:
     return proc.returncode == 0
 
 
+def is_windows_task_registered() -> bool:
+    if sys.platform != "win32":
+        return False
+    proc = subprocess.run(
+        build_windows_schtasks_query_cmd(),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
 def install_git_hooks(repo: Path = HERMES_REPO) -> list[str]:
     hooks_dir = repo / ".git" / "hooks"
+    if not (repo / ".git").exists():
+        return []
     hooks_dir.mkdir(parents=True, exist_ok=True)
     snippet = _hook_snippet()
     installed: list[str] = []
@@ -101,14 +159,17 @@ def install_git_hooks(repo: Path = HERMES_REPO) -> list[str]:
         else:
             text = "#!/bin/sh\n\n" + snippet
         hook_path.write_text(text, encoding="utf-8")
-        mode = hook_path.stat().st_mode
-        hook_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        if sys.platform != "win32":
+            mode = hook_path.stat().st_mode
+            hook_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         installed.append(str(hook_path))
     return installed
 
 
 def uninstall_git_hooks(repo: Path = HERMES_REPO) -> list[str]:
     hooks_dir = repo / ".git" / "hooks"
+    if not hooks_dir.exists():
+        return []
     removed: list[str] = []
     pattern = re.compile(
         rf"\n?{re.escape(HOOK_BEGIN)}.*?{re.escape(HOOK_END)}\n?",
@@ -135,11 +196,41 @@ def git_hooks_status(repo: Path = HERMES_REPO) -> dict[str, bool]:
     out: dict[str, bool] = {}
     for name in HOOK_NAMES:
         p = hooks_dir / name
-        out[name] = p.exists() and os.access(p, os.X_OK) and HOOK_BEGIN in p.read_text(encoding="utf-8")
+        exists = p.exists()
+        is_exec = True if sys.platform == "win32" else (exists and os.access(p, os.X_OK))
+        out[name] = exists and is_exec and HOOK_BEGIN in p.read_text(encoding="utf-8")
     return out
 
 
 def install_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
+    hooks = install_git_hooks(repo)
+
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            build_windows_schtasks_create_cmd(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"Failed to register Task Scheduler job: {proc.stdout}\n{proc.stderr}")
+        reg = is_windows_task_registered()
+        return {
+            "backend": "schtasks",
+            "task_name": WINDOWS_TASK_NAME,
+            "active": reg,
+            "launchd_loaded": False,
+            "hooks_installed": hooks,
+        }
+
+    if sys.platform != "darwin":
+        return {
+            "backend": "git-hooks",
+            "active": bool(hooks),
+            "launchd_loaded": False,
+            "hooks_installed": hooks,
+        }
+
     LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     plist_data = build_launchd_plist()
     tmp = LAUNCHD_PLIST_PATH.with_suffix(".plist.tmp")
@@ -148,7 +239,6 @@ def install_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
     os.replace(tmp, LAUNCHD_PLIST_PATH)
 
     domain = f"gui/{_uid()}"
-    # Bootout first if already loaded so updated plist takes effect
     subprocess.run(
         ["/bin/launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
         capture_output=True,
@@ -160,7 +250,6 @@ def install_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
         text=True,
     )
     if boot.returncode != 0:
-        # Fallback for environments where bootstrap returns non-zero
         load = subprocess.run(
             ["/bin/launchctl", "load", "-w", str(LAUNCHD_PLIST_PATH)],
             capture_output=True,
@@ -171,15 +260,44 @@ def install_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
                 f"Failed to load launchd agent: bootstrap={boot.stderr} load={load.stderr}"
             )
 
-    hooks = install_git_hooks(repo)
+    loaded = is_launchd_loaded()
     return {
+        "backend": "launchd",
         "plist": str(LAUNCHD_PLIST_PATH),
-        "launchd_loaded": is_launchd_loaded(),
+        "active": loaded,
+        "launchd_loaded": loaded,
         "hooks_installed": hooks,
     }
 
 
 def uninstall_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
+    removed_hooks = uninstall_git_hooks(repo)
+
+    if sys.platform == "win32":
+        subprocess.run(
+            build_windows_schtasks_delete_cmd(),
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+        )
+        return {
+            "backend": "schtasks",
+            "task_name": WINDOWS_TASK_NAME,
+            "active": is_windows_task_registered(),
+            "plist_removed": False,
+            "launchd_loaded": False,
+            "hooks_removed": removed_hooks,
+        }
+
+    if sys.platform != "darwin":
+        return {
+            "backend": "git-hooks",
+            "active": False,
+            "plist_removed": False,
+            "launchd_loaded": False,
+            "hooks_removed": removed_hooks,
+        }
+
     domain = f"gui/{_uid()}"
     subprocess.run(
         ["/bin/launchctl", "bootout", f"{domain}/{LAUNCHD_LABEL}"],
@@ -195,19 +313,40 @@ def uninstall_watcher(repo: Path = HERMES_REPO) -> dict[str, Any]:
     if LAUNCHD_PLIST_PATH.exists():
         LAUNCHD_PLIST_PATH.unlink()
         removed_plist = True
-    removed_hooks = uninstall_git_hooks(repo)
     return {
+        "backend": "launchd",
         "plist_removed": removed_plist,
+        "active": is_launchd_loaded(),
         "launchd_loaded": is_launchd_loaded(),
         "hooks_removed": removed_hooks,
     }
 
 
 def watcher_status(repo: Path = HERMES_REPO) -> dict[str, Any]:
+    hooks = git_hooks_status(repo)
+    if sys.platform == "win32":
+        reg = is_windows_task_registered()
+        return {
+            "backend": "schtasks",
+            "task_name": WINDOWS_TASK_NAME,
+            "active": reg,
+            "launchd_loaded": False,
+            "git_hooks": hooks,
+        }
+    if sys.platform == "darwin":
+        loaded = is_launchd_loaded()
+        return {
+            "backend": "launchd",
+            "label": LAUNCHD_LABEL,
+            "plist_path": str(LAUNCHD_PLIST_PATH),
+            "plist_exists": LAUNCHD_PLIST_PATH.exists(),
+            "active": loaded,
+            "launchd_loaded": loaded,
+            "git_hooks": hooks,
+        }
     return {
-        "label": LAUNCHD_LABEL,
-        "plist_path": str(LAUNCHD_PLIST_PATH),
-        "plist_exists": LAUNCHD_PLIST_PATH.exists(),
-        "launchd_loaded": is_launchd_loaded(),
-        "git_hooks": git_hooks_status(repo),
+        "backend": "git-hooks",
+        "active": all(hooks.values()),
+        "launchd_loaded": False,
+        "git_hooks": hooks,
     }

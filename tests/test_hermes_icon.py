@@ -32,6 +32,7 @@ from hermes_icon.applier import (
     check_and_heal,
     inspect_surfaces,
     is_update_in_progress,
+    patch_windows_app_dir,
     replacer_lock,
 )
 from hermes_icon.asar import patch_asar, read_asar_header, verify_asar_integrity
@@ -43,6 +44,7 @@ from hermes_icon.config import (
     HERMES_APP,
     HERMES_REPO,
     IconConfig,
+    discover_windows_app_dirs,
     load_config,
     load_state,
     save_state,
@@ -51,9 +53,19 @@ from hermes_icon.gui import start_gui_server
 from hermes_icon.presets import PRESET_ORDER, PRESETS, VIEWBOX, build_preset_svg, resolve_preset_id
 from hermes_icon.renderer import IconRenderer, _load_generate_icons_module, apply_to_repo
 from hermes_icon.tui import LEFT_COL_WIDTH, render_tui_frame
-from hermes_icon.watcher import _launcher_bin, build_launchd_plist, git_hooks_status, is_launchd_loaded
+from hermes_icon.watcher import (
+    WINDOWS_TASK_NAME,
+    _launcher_bin,
+    build_launchd_plist,
+    build_windows_schtasks_create_cmd,
+    build_windows_schtasks_delete_cmd,
+    build_windows_schtasks_query_cmd,
+    git_hooks_status,
+    is_launchd_loaded,
+)
 
 BIN_HERMES_ICON = Path(__file__).resolve().parent.parent / "bin" / "hermes-icon"
+BIN_HERMES_ICON_CMD = Path(__file__).resolve().parent.parent / "bin" / "hermes-icon.cmd"
 
 
 class TestPresetsAndValidation(unittest.TestCase):
@@ -133,7 +145,14 @@ class TestCustomIcons(unittest.TestCase):
         frames = [base.resize((s, s), Image.LANCZOS) for s in (16, 32, 64, 128, 256, 512, 1024)]
         base.save(path, format="ICNS", append_images=frames[1:])
 
-    def test_custom_png_svg_icns_preserve_color_and_pass_mlz(self) -> None:
+    def _create_ico(self, path: Path) -> None:
+        base = Image.new("RGBA", (256, 256), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(base)
+        draw.rounded_rectangle((24, 24, 232, 232), radius=48, fill=(220, 60, 100, 255))
+        draw.ellipse((78, 78, 178, 178), fill=(80, 220, 190, 255))
+        base.save(path, format="ICO", sizes=[(16, 16), (32, 32), (64, 64), (128, 128), (256, 256)])
+
+    def test_custom_png_svg_icns_ico_preserve_color_and_pass_mlz(self) -> None:
         gen_mod = _load_generate_icons_module()
         import xml.etree.ElementTree as ET
 
@@ -142,11 +161,13 @@ class TestCustomIcons(unittest.TestCase):
             png_p = tmp_dir / "logo.png"
             svg_p = tmp_dir / "logo.svg"
             icns_p = tmp_dir / "logo.icns"
+            ico_p = tmp_dir / "logo.ico"
             self._create_colored_png(png_p)
             self._create_multicolor_svg(svg_p)
             self._create_icns(icns_p)
+            self._create_ico(ico_p)
 
-            for custom_file in (png_p, svg_p, icns_p):
+            for custom_file in (png_p, svg_p, icns_p, ico_p):
                 cfg = IconConfig(mode="custom", custom_path=str(custom_file), scale=0.78)
                 renderer = IconRenderer(cfg)
                 sq = renderer.render_squircle(512, dark=False, mac_grid=False)
@@ -225,6 +246,61 @@ class TestAsarPatching(unittest.TestCase):
                 hashlib.sha256(hdr_bytes).hexdigest(),
                 plist_data["ElectronAsarIntegrity"]["Resources/app.asar"]["hash"],
             )
+
+    def test_windows_unpacked_app_patch_and_asar_integrity(self) -> None:
+        asar_src = HERMES_APP / "Contents" / "Resources" / "app.asar"
+        if not asar_src.exists():
+            self.skipTest("Hermes.app app.asar not present")
+
+        with tempfile.TemporaryDirectory(prefix="hermes-win-test-") as tmp:
+            tmp_dir = Path(tmp)
+            fake_repo = tmp_dir / "hermes-agent"
+            desktop_assets = fake_repo / "apps" / "desktop" / "assets"
+            desktop_public = fake_repo / "apps" / "desktop" / "public"
+            win_dir = fake_repo / "apps" / "desktop" / "release" / "win-unpacked"
+            wres = win_dir / "resources"
+            unpacked_dist = wres / "app.asar.unpacked" / "dist"
+
+            desktop_assets.mkdir(parents=True)
+            desktop_public.mkdir(parents=True)
+            unpacked_dist.mkdir(parents=True)
+
+            # Seed fake repo target icons matching expected Windows assets
+            fake_ico = b"\x00\x00\x01\x00FAKE_WIN_ICO_" + os.urandom(64)
+            fake_png = b"\x89PNG\r\n\x1a\nFAKE_WIN_PNG_" + os.urandom(64)
+            (desktop_assets / "icon.ico").write_bytes(fake_ico)
+            (desktop_assets / "icon.png").write_bytes(fake_png)
+            (desktop_assets / "icon.icns").write_bytes(b"icns" + os.urandom(32))
+            (desktop_assets / "icon-mac.png").write_bytes(fake_png)
+            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+                (desktop_public / fname).write_bytes(fake_png)
+                (unpacked_dist / fname).write_bytes(b"\x89PNG\r\n\x1a\nOLD_WIN_" + os.urandom(32))
+
+            (wres / "icon.ico").write_bytes(b"OLD_ICO")
+            shutil.copy2(asar_src, wres / "app.asar")
+
+            discovered = discover_windows_app_dirs(fake_repo)
+            self.assertIn(win_dir, discovered)
+
+            res = patch_windows_app_dir(win_dir, fake_repo)
+            self.assertTrue(res["patched"])
+            self.assertEqual((wres / "icon.ico").read_bytes(), fake_ico)
+            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+                self.assertEqual((unpacked_dist / fname).read_bytes(), fake_png)
+
+            ok, errs = verify_asar_integrity(
+                wres / "app.asar",
+                None,
+                unpacked_dir=wres / "app.asar.unpacked",
+                check_paths=[
+                    "public/nous-girl.png",
+                    "assets/icon.png",
+                    "dist/nous-girl.png",
+                    "dist/nous-girl-dark.png",
+                    "dist/apple-touch-icon.png",
+                ],
+            )
+            self.assertTrue(ok, f"Windows ASAR verify failed: {errs}")
 
 
 class TestGuiServer(unittest.TestCase):
@@ -310,7 +386,23 @@ class TestLockAndWatcherConfig(unittest.TestCase):
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.1")
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.2")
+
+    def test_windows_task_scheduler_and_cmd_launcher(self) -> None:
+        self.assertTrue(BIN_HERMES_ICON_CMD.is_file())
+        cmd_text = BIN_HERMES_ICON_CMD.read_text(encoding="utf-8")
+        self.assertIn("hermes-icon 0.1.2", cmd_text)
+        self.assertIn("run.py", cmd_text)
+
+        win_launcher = _launcher_bin(BIN_HERMES_ICON_CMD.parent, platform="win32")
+        self.assertEqual(win_launcher, BIN_HERMES_ICON_CMD)
+
+        create_cmd = build_windows_schtasks_create_cmd(win_launcher)
+        self.assertEqual(create_cmd[:4], ["schtasks", "/Create", "/TN", WINDOWS_TASK_NAME])
+        self.assertIn("MINUTE", create_cmd)
+        self.assertIn(f'"{win_launcher}" check --apply', create_cmd)
+        self.assertEqual(build_windows_schtasks_query_cmd(), ["schtasks", "/Query", "/TN", WINDOWS_TASK_NAME])
+        self.assertEqual(build_windows_schtasks_delete_cmd(), ["schtasks", "/Delete", "/TN", WINDOWS_TASK_NAME, "/F"])
 
     def test_homebrew_cellar_opt_resolution(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hermes-brew-test-") as tmp:

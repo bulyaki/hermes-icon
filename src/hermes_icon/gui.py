@@ -5,7 +5,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import os
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -249,9 +251,9 @@ HTML_PAGE = """<!doctype html>
       </div>
 
       <div class="card">
-        <h2>Custom Icon (.svg, .png, .icns, .jpg, .webp)</h2>
+        <h2>Custom Icon (.svg, .png, .icns, .ico, .jpg, .webp)</h2>
         <label class="dropzone" id="dropzone">
-          <input type="file" id="custom-file" accept=".svg,.png,.icns,.jpg,.jpeg,.webp" />
+          <input type="file" id="custom-file" accept=".svg,.png,.icns,.ico,.jpg,.jpeg,.webp" />
           <div style="font-weight: 600; font-size: 13px;">Drop icon here or click to browse</div>
           <div id="custom-filename" style="font-size: 12px; color: var(--muted); margin-top: 6px;">No custom file uploaded</div>
         </label>
@@ -259,7 +261,7 @@ HTML_PAGE = """<!doctype html>
           <span>Optional dark-mode variant:</span>
           <label style="color: var(--accent); cursor: pointer;">
             Choose dark file
-            <input type="file" id="custom-dark-file" accept=".svg,.png,.icns,.jpg,.jpeg,.webp" style="display:none;" />
+            <input type="file" id="custom-dark-file" accept=".svg,.png,.icns,.ico,.jpg,.jpeg,.webp" style="display:none;" />
           </label>
         </div>
         <div id="custom-dark-filename" style="font-size: 11px; color: var(--muted); margin-top: 3px;"></div>
@@ -382,21 +384,22 @@ async function refreshStatus() {
 
   const s = data.surfaces;
   const w = data.watcher;
+  const wActive = Boolean(w.active ?? w.launchd_loaded);
   const dot = document.getElementById("status-dot");
   const st = document.getElementById("status-text");
-  if (!s.needs_apply && w.launchd_loaded) {
+  if (!s.needs_apply && wActive) {
     dot.className = "dot";
     st.textContent = `Synced (${s.matching}/${s.total_surfaces}) • Watcher active`;
   } else {
     dot.className = "dot warn";
-    st.textContent = `Needs apply (${s.matching}/${s.total_surfaces}) • Watcher ${w.launchd_loaded ? "on" : "off"}`;
+    st.textContent = `Needs apply (${s.matching}/${s.total_surfaces}) • Watcher ${wActive ? "on" : "off"}`;
   }
 
   const meta = document.getElementById("meta-list");
   meta.innerHTML = `
     <div class="meta-item"><span>Active icon</span><span>${data.config.mode === "preset" ? data.config.preset : "custom"}</span></div>
     <div class="meta-item"><span>Surfaces synced</span><span>${s.matching} / ${s.total_surfaces}</span></div>
-    <div class="meta-item"><span>launchd watcher</span><span>${w.launchd_loaded ? "loaded" : "not loaded"}</span></div>
+    <div class="meta-item"><span>Watcher (${w.backend || "launchd"})</span><span>${wActive ? "active" : "inactive"}</span></div>
     <div class="meta-item"><span>Git hooks</span><span>${Object.values(w.git_hooks).every(Boolean) ? "installed" : "partial/none"}</span></div>
   `;
   renderPresets();
@@ -667,7 +670,7 @@ def start_gui_server(
                     payload = self._read_json()
                     filename = Path(payload.get("filename", "icon.png")).name
                     ext = Path(filename).suffix.lower()
-                    if ext not in (".svg", ".png", ".icns", ".jpg", ".jpeg", ".webp"):
+                    if ext not in (".svg", ".png", ".icns", ".ico", ".jpg", ".jpeg", ".webp"):
                         raise ValueError(f"Unsupported extension {ext!r}")
                     raw = base64.b64decode(payload["data_base64"])
                     with upload_lock:
@@ -755,7 +758,15 @@ def start_gui_server(
     bound_port = server.server_address[1]
     url = f"http://127.0.0.1:{bound_port}/"
     if open_browser:
-        subprocess.Popen(["/usr/bin/open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if sys.platform == "darwin":
+            subprocess.Popen(["/usr/bin/open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif sys.platform == "win32":
+            try:
+                os.startfile(url)  # type: ignore[attr-defined]
+            except Exception:
+                subprocess.Popen(["cmd", "/c", "start", "", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(["xdg-open", url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return server, url
 
 

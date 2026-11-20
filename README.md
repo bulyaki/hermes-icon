@@ -1,33 +1,34 @@
 # hermes-icon
 
-A macOS utility to customize the Hermes desktop application icon across every surface (source repository assets, compiled macOS `Assets.car`, `icon.icns`, `app.asar` & `ElectronAsarIntegrity`, code signature, and web UI favicon) and automatically re-apply it after updates via `launchd` and Git hooks.
+A cross-platform utility to customize the Hermes desktop application icon across every surface (source repository assets, compiled macOS `Assets.car`, `icon.icns`, Windows `icon.ico`, `app.asar` & `ElectronAsarIntegrity`, code signature, and web UI favicon) and automatically re-apply it after updates via `launchd` (macOS), Task Scheduler (Windows), and Git hooks.
 
 ## Features
 
 - **9 Curated Presets**: Mirror-mosaic chrome portrait (`disco-girl`) plus 8 geometric vector emblems rendered in both light and dark squircle plates (`caduceus`, `winged-helmet`, `winged-sandal`, `monogram-h`, `neural-core`, `compass`, `terminal`, `shield`).
-- **Custom Icon Support**: Use any `.svg`, `.png`, `.icns`, `.jpg`, or `.webp` file (with optional `--custom-dark`, `--scale`, `--full-bleed`, and `--bg-light`/`--bg-dark` plate colors).
+- **Custom Icon Support**: Use any `.svg`, `.png`, `.icns`, `.ico`, `.jpg`, or `.webp` file (with optional `--custom-dark`, `--scale`, `--full-bleed`, and `--bg-light`/`--bg-dark` plate colors).
 - **Three Interfaces**:
   - **CLI** (`hermes-icon list`, `hermes-icon set ...`, `hermes-icon status`)
-  - **Interactive Terminal Picker (TUI)** (`hermes-icon pick` or `hermes-icon` in a TTY) with live 24-bit color half-block previews and native macOS Finder file dialog (`f`)
+  - **Interactive Terminal Picker (TUI)** (`hermes-icon pick` or `hermes-icon` in a TTY) with live 24-bit color half-block previews and native file dialog (`f` via Finder on macOS or Explorer on Windows)
   - **Local Web GUI** (`hermes-icon gui`) with live light/dark squircle previews, drag-and-drop upload, color pickers, scale slider, and one-click Apply & Watch
 - **Full Surface Replacement**:
   - Regenerates all 99 targets in `~/.hermes/hermes-agent` (`nous-girl-{black,white}.svg` compatible with `generate_icons.py --check`, PNG/ICO/ICNS/MSIX/Icon Composer assets)
   - Updates `~/.hermes/hermes-agent/hermes_cli/web_dist/favicon.ico`
-  - Compiles macOS 26 `Assets.car` via `/usr/bin/actool`, replaces `icon.icns` / `icon.ico` / `app.asar.unpacked/dist/*`, patches `app.asar` & `Info.plist` (`ElectronAsarIntegrity`), and re-signs `Hermes.app` with `/usr/bin/codesign`
-  - Patches `/Applications/Hermes.app/Contents/Resources/icon.icns` when present and writable
+  - **macOS**: Compiles macOS 26 `Assets.car` via `/usr/bin/actool`, replaces `icon.icns` / `icon.ico` / `app.asar.unpacked/dist/*`, patches `app.asar` & `Info.plist` (`ElectronAsarIntegrity`), re-signs `Hermes.app` with `/usr/bin/codesign`, and patches `/Applications/Hermes.app/Contents/Resources/icon.icns` when present and writable
+  - **Windows**: Patches `win-unpacked` / `win-arm64-unpacked` / `win-ia32-unpacked` and `%LOCALAPPDATA%\Programs\Hermes` (`resources/icon.ico`, `resources/app.asar`, `resources/app.asar.unpacked/dist/*`) and refreshes the Windows icon cache & Start Menu/Desktop `.lnk` shortcuts
 - **Automatic Update Recovery**:
-  - Installs a `launchd` agent (`WatchPaths` + 60s fingerprint check) and Git hooks (`post-merge`, `post-checkout`, `post-rewrite`) that detect when `hermes update` restores the default icon and re-apply your chosen icon automatically.
+  - **macOS**: Installs a `launchd` agent (`WatchPaths` + 60s fingerprint check) and Git hooks (`post-merge`, `post-checkout`, `post-rewrite`)
+  - **Windows**: Registers a `HermesIconReplacer` Task Scheduler job (60s check) and Git hooks so updates that restore the default icon re-apply your chosen icon automatically
 - **Lossless Backup & Restore**:
   - Backs up original icons to `~/.hermes/icon-replacer/backups/original/` with a SHA-256 `manifest.json` on first run; run `hermes-icon restore` anytime to revert.
 
 ## Requirements
 
-- macOS (tested on Apple Silicon with Xcode / `actool` and `codesign`)
-- An active Hermes installation under `~/.hermes/installs/` (resolved automatically via `facts.json` for `Pillow` and `resvg_py`)
+- **macOS** (tested on Apple Silicon with Xcode / `actool` and `codesign`), **Windows 10/11**, or **Linux**
+- Python 3.11+ with `Pillow` and `resvg_py` (automatically resolved from your Hermes installation under `~/.hermes/installs/` via `facts.json` when present, or installed directly via `uv`)
 
 ## Installation
 
-### Homebrew (Recommended)
+### macOS (Homebrew)
 
 ```bash
 brew install bulyaki/tap/hermes-icon
@@ -40,13 +41,35 @@ brew tap bulyaki/tap
 brew install hermes-icon
 ```
 
+### Windows (Scoop)
+
+```powershell
+scoop bucket add bulyaki https://github.com/bulyaki/scoop-bucket
+scoop install hermes-icon
+```
+
+### Windows / macOS / Linux (`uv`)
+
+```bash
+uv tool install git+https://github.com/bulyaki/hermes-icon
+```
+
 ### From Source
+
+macOS / Linux:
 
 ```sh
 git clone https://github.com/bulyaki/hermes-icon.git ~/Work/hermes-icon
 mkdir -p ~/.local/bin ~/.hermes/bin
 ln -sfn ~/Work/hermes-icon/bin/hermes-icon ~/.local/bin/hermes-icon
 ln -sfn ~/Work/hermes-icon/bin/hermes-icon ~/.hermes/bin/hermes-icon
+```
+
+Windows (PowerShell):
+
+```powershell
+git clone https://github.com/bulyaki/hermes-icon.git "$HOME\Work\hermes-icon"
+# Add $HOME\Work\hermes-icon\bin to your PATH to invoke hermes-icon.cmd
 ```
 
 Activate the background watcher:
@@ -68,18 +91,20 @@ hermes-icon gui
 hermes-icon list
 
 # Apply a built-in preset everywhere
+hermes-icon set disco-girl
 hermes-icon set caduceus
 hermes-icon set winged-helmet
 
 # Apply a custom icon with optional dark variant and plate colors
 hermes-icon set --custom ~/Pictures/my-icon.png --scale 0.80
 hermes-icon set --custom ~/Pictures/logo.svg --bg-light '#f8fafc' --bg-dark '#111827'
+hermes-icon set --custom C:\Icons\my-app.ico
 
 # Check sync state across all tracked surfaces
 hermes-icon status
 hermes-icon check [--apply]
 
-# Manage launchd agent and git hooks
+# Manage background watcher (launchd on macOS, Task Scheduler on Windows) and git hooks
 hermes-icon watch [install|uninstall|status|run]
 
 # Restore original icons and pause the watcher
@@ -107,6 +132,7 @@ Runtime configuration, backups, lockfiles, and logs are kept outside the source 
 - `HERMES_HOME`: Base Hermes directory (default: `~/.hermes`)
 - `HERMES_REPO`: Hermes repository path (default: `$HERMES_HOME/hermes-agent`)
 - `HERMES_ICON_STATE_DIR`: Runtime state directory (default: `$HERMES_HOME/icon-replacer`)
+- `HERMES_PYTHON`: Optional explicit Python interpreter path override
 
 ## License
 

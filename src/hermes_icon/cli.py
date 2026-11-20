@@ -109,6 +109,9 @@ def _cmd_set(args: argparse.Namespace) -> int:
             f"  - Hermes.app   : {car_state}, icon.icns, icon.ico, app.asar "
             f"(packed={asar['packed_updated']}, unpacked={asar['unpacked_updated']}), codesign verified"
         )
+    if res.get("windows_apps"):
+        for w in res["windows_apps"]:
+            print(f"  - Windows app  : {w['path']} (patched={w['patched']})")
     print(f"  - /Applications/Hermes.app icon.icns patched: {res['applications_hermes_app_patched']}")
     return 0
 
@@ -143,7 +146,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
         for s in surf["missing"]:
             print(f"  - missing: {s}")
 
-    print(f"launchd agent   : {watch['label']} ({'loaded' if watch['launchd_loaded'] else 'not loaded'})")
+    if watch.get("backend") == "schtasks":
+        print(f"Task Scheduler  : {watch['task_name']} ({'registered' if watch['active'] else 'not registered'})")
+    elif watch.get("backend") == "launchd":
+        print(f"launchd agent   : {watch['label']} ({'loaded' if watch['launchd_loaded'] else 'not loaded'})")
+    else:
+        print(f"Watcher backend : {watch.get('backend', 'git-hooks')}")
     hooks = ", ".join(f"{k}={'ok' if v else 'missing'}" for k, v in watch["git_hooks"].items())
     print(f"Git hooks       : {hooks}")
     return 0
@@ -169,12 +177,17 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     sub = args.watch_action or "status"
     if sub == "install":
         res = install_watcher()
-        print(f"Installed launchd agent: {res['plist']} (loaded={res['launchd_loaded']})")
+        if res.get("backend") == "schtasks":
+            print(f"Registered Task Scheduler job: {res['task_name']} (active={res['active']})")
+        elif res.get("backend") == "launchd":
+            print(f"Installed launchd agent: {res['plist']} (loaded={res['launchd_loaded']})")
+        else:
+            print(f"Installed git-hook watcher (active={res['active']})")
         print(f"Installed git hooks  : {len(res['hooks_installed'])} ({', '.join(Path(p).name for p in res['hooks_installed'])})")
         return 0
     if sub == "uninstall":
         res = uninstall_watcher()
-        print(f"Uninstalled watcher (plist_removed={res['plist_removed']}, launchd_loaded={res['launchd_loaded']})")
+        print(f"Uninstalled watcher (active={res.get('active', False)})")
         return 0
     if sub == "run":
         res = check_and_heal(apply_if_needed=True)
@@ -210,7 +223,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_set = sub.add_parser("set", help="Apply a preset or custom icon everywhere")
     p_set.add_argument("preset", nargs="?", help="Preset ID (e.g. caduceus)")
-    p_set.add_argument("--custom", help="Path to custom .svg, .png, .icns, .jpg, or .webp icon")
+    p_set.add_argument("--custom", help="Path to custom .svg, .png, .icns, .ico, .jpg, or .webp icon")
     p_set.add_argument("--custom-dark", help="Optional dark-mode custom icon path")
     p_set.add_argument("--scale", type=float, help="Icon scale inside squircle (0.35..1.0, default 0.78)")
     p_set.add_argument("--full-bleed", action="store_true", help="Fill squircle mask edge-to-edge (custom icons)")

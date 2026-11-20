@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-icon"
-version = "0.1.1"
-description = "macOS utility to customize the Hermes desktop app icon and automatically persist it across updates"
+version = "0.1.2"
+description = "Cross-platform utility to customize the Hermes desktop app icon and automatically persist it across updates"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 authors = [{ name = "Peter Bulyaki" }]
 dependencies = [
-  "Pillow>=10.0",
-  "resvg-py>=0.4",
+  "pillow>=10.0.0",
+  "resvg-py>=0.2.0",
 ]
 
 [project.scripts]

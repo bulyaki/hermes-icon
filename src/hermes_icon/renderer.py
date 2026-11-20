@@ -119,7 +119,7 @@ def _detect_full_bleed(img: Image.Image, ext: str) -> bool:
     ]
     if all(c >= 240 for c in corners):
         return True
-    if ext == ".icns":
+    if ext in (".icns", ".ico"):
         bbox = alpha.point(lambda v: 255 if v > 8 else 0).getbbox()
         if bbox:
             cropped = alpha.crop(bbox)
@@ -138,7 +138,7 @@ def _detect_full_bleed(img: Image.Image, ext: str) -> bool:
 
 
 def _load_custom_image(path: Path) -> tuple[Image.Image, str, str | None]:
-    """Load .svg/.png/.jpg/.webp/.icns as (1024-scale RGBA Image, ext, raw_svg_or_None)."""
+    """Load .svg/.png/.icns/.ico/.jpg/.webp as (RGBA Image, ext, raw_svg_or_None)."""
     if not path.exists():
         raise FileNotFoundError(f"Custom icon not found: {path}")
     ext = path.suffix.lower()
@@ -147,11 +147,15 @@ def _load_custom_image(path: Path) -> tuple[Image.Image, str, str | None]:
         data = resvg_py.svg_to_bytes(svg_string=svg_text, width=1024, height=1024)
         img = Image.open(io.BytesIO(data)).convert("RGBA")
         return img, ext, svg_text
-    if ext in (".png", ".jpg", ".jpeg", ".webp", ".icns"):
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".icns", ".ico"):
         with Image.open(path) as im:
+            if ext == ".ico" and im.info.get("sizes"):
+                im.size = max(im.info["sizes"], key=lambda s: s[0] * s[1])
             img = im.convert("RGBA")
         return img, ext, None
-    raise ValueError(f"Unsupported custom icon extension {ext!r} (expected .svg, .png, .icns, .jpg, .webp)")
+    raise ValueError(
+        f"Unsupported custom icon extension {ext!r} (expected .svg, .png, .icns, .ico, .jpg, .webp)"
+    )
 
 
 def _trim_alpha(img: Image.Image) -> Image.Image:

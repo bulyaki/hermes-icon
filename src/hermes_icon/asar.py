@@ -192,26 +192,27 @@ def update_info_plist_asar_integrity(info_plist_path: Path, header_sha256: str) 
 
 def verify_asar_integrity(
     asar_path: Path,
-    info_plist_path: Path,
+    info_plist_path: Path | None = None,
     unpacked_dir: Path | None = None,
     check_paths: list[str] | None = None,
 ) -> tuple[bool, list[str]]:
-    """Verify ASAR header hash matches Info.plist and file entries match their integrity hashes."""
+    """Verify ASAR header hash matches Info.plist (when present) and entry integrity hashes."""
     errors: list[str] = []
     tree, header_bytes, payload_start = read_asar_header(asar_path)
     actual_header_hash = hashlib.sha256(header_bytes).hexdigest()
 
-    with info_plist_path.open("rb") as f:
-        plist_data = plistlib.load(f)
-    expected_header_hash = (
-        plist_data.get("ElectronAsarIntegrity", {})
-        .get("Resources/app.asar", {})
-        .get("hash")
-    )
-    if actual_header_hash != expected_header_hash:
-        errors.append(
-            f"ASAR header SHA-256 mismatch: header={actual_header_hash} Info.plist={expected_header_hash}"
+    if info_plist_path is not None and info_plist_path.exists():
+        with info_plist_path.open("rb") as f:
+            plist_data = plistlib.load(f)
+        expected_header_hash = (
+            plist_data.get("ElectronAsarIntegrity", {})
+            .get("Resources/app.asar", {})
+            .get("hash")
         )
+        if actual_header_hash != expected_header_hash:
+            errors.append(
+                f"ASAR header SHA-256 mismatch: header={actual_header_hash} Info.plist={expected_header_hash}"
+            )
 
     targets = check_paths or [rel for rel, _ in _iter_files(tree)]
     with asar_path.open("rb") as f:

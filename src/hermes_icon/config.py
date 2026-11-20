@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
+
+IS_WINDOWS = sys.platform == "win32"
+IS_MACOS = sys.platform == "darwin"
 
 APP_ROOT = Path(__file__).resolve().parents[2]
 BIN_DIR = APP_ROOT / "bin"
@@ -35,6 +39,28 @@ REPO_WEB_FAVICON = HERMES_REPO / "web" / "public" / "favicon.ico"
 
 HERMES_APP = HERMES_REPO / "apps" / "desktop" / "release" / "mac-arm64" / "Hermes.app"
 APPLICATIONS_HERMES_APP = Path("/Applications/Hermes.app")
+
+
+def discover_windows_app_dirs(repo: Path = HERMES_REPO) -> list[Path]:
+    """Return unpacked Windows Electron desktop app directories containing resources/app.asar or Hermes.exe."""
+    candidates: list[Path] = [
+        repo / "apps" / "desktop" / "release" / "win-unpacked",
+        repo / "apps" / "desktop" / "release" / "win-arm64-unpacked",
+        repo / "apps" / "desktop" / "release" / "win-ia32-unpacked",
+    ]
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        candidates.append(Path(local_app_data) / "Programs" / "Hermes")
+
+    found: list[Path] = []
+    seen: set[Path] = set()
+    for cand in candidates:
+        if cand in seen or not cand.is_dir():
+            continue
+        if (cand / "resources" / "app.asar").exists() or (cand / "Hermes.exe").exists():
+            seen.add(cand)
+            found.append(cand)
+    return found
 
 LAUNCHD_LABEL = "com.codeproquo.hermes-icon-replacer"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"

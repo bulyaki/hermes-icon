@@ -7,10 +7,16 @@ import re
 import shutil
 import subprocess
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
+
+if sys.platform != "win32":
+    import termios
+    import tty
+else:
+    import msvcrt  # type: ignore[import-not-found]
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
 
 from PIL import Image
 
@@ -27,7 +33,41 @@ def _visible_len(s: str) -> int:
     return len(_ANSI_RE.sub("", s))
 
 
+def _enable_windows_vt() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32.SetConsoleMode(handle, mode.value | 0x0004)
+    except Exception:
+        pass
+
+
+def _read_key_windows() -> str:
+    ch = msvcrt.getwch()  # type: ignore[name-defined]
+    if ch in ("\x00", "\xe0"):
+        ext = msvcrt.getwch()  # type: ignore[name-defined]
+        if ext == "H":
+            return "UP"
+        if ext == "P":
+            return "DOWN"
+        return "ESC"
+    if ch in ("\r", "\n"):
+        return "ENTER"
+    if ch == "\x03":
+        return "QUIT"
+    if ch == "\x1b":
+        return "ESC"
+    return ch
+
+
 def _read_key(fd: int) -> str:
+    if sys.platform == "win32":
+        return _read_key_windows()
     ch = os.read(fd, 1).decode("utf-8", errors="ignore")
     if ch == "\x1b":
         # Check for ANSI escape sequence (arrow keys)
@@ -171,14 +211,32 @@ def render_tui_frame(
 
 
 def _pick_file_via_finder() -> str | None:
-    script = (
-        'POSIX path of (choose file of type '
-        '{"public.svg-image", "public.png", "com.apple.icns", "public.jpeg", "org.webmproject.webp"} '
-        'with prompt "Choose a custom Hermes icon")'
-    )
-    proc = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
-    if proc.returncode == 0 and proc.stdout.strip():
-        return proc.stdout.strip()
+    if sys.platform == "win32":
+        ps_script = (
+            "Add-Type -AssemblyName System.Windows.Forms; "
+            "$d = New-Object System.Windows.Forms.OpenFileDialog; "
+            "$d.Title = 'Choose a custom Hermes icon'; "
+            "$d.Filter = 'Icon files (*.svg;*.png;*.ico;*.icns;*.jpg;*.jpeg;*.webp)|*.svg;*.png;*.ico;*.icns;*.jpg;*.jpeg;*.webp'; "
+            "if ($d.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.FileName }"
+        )
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-Sta", "-Command", ps_script],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+        return None
+
+    if sys.platform == "darwin":
+        script = (
+            'POSIX path of (choose file of type '
+            '{"public.svg-image", "public.png", "com.apple.icns", "com.microsoft.ico", "public.jpeg", "org.webmproject.webp"} '
+            'with prompt "Choose a custom Hermes icon")'
+        )
+        proc = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, text=True)
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
     return None
 
 
@@ -224,17 +282,28 @@ def run_tui(refresh_dock: bool = False) -> int:
         sys.stdout.write(frame)
         sys.stdout.flush()
 
-    fd = sys.stdin.fileno()
-    old_tty = termios.tcgetattr(fd)
-    try:
-        tty.setraw(fd)
-        while True:
-            termios.tcsetattr(fd, termios.TCSANOW, old_tty)
-            draw()
+    _enable_windows_vt()
+    is_win = sys.platform == "win32"
+    fd = -1 if is_win else sys.stdin.fileno()
+    old_tty = None if is_win else termios.tcgetattr(fd)
+
+    def _set_raw() -> None:
+        if not is_win:
             tty.setraw(fd)
+
+    def _restore_tty() -> None:
+        if not is_win and old_tty is not None:
+            termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+
+    try:
+        _set_raw()
+        while True:
+            _restore_tty()
+            draw()
+            _set_raw()
             key = _read_key(fd)
             if key in ("q", "Q", "ESC", "QUIT"):
-                termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+                _restore_tty()
                 sys.stdout.write("\n")
                 return 0
             if key in ("UP", "k", "K"):
@@ -247,12 +316,12 @@ def run_tui(refresh_dock: bool = False) -> int:
                 selected_idx = int(key) - 1
                 status_msg = ""
             elif key in ("g", "G"):
-                termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+                _restore_tty()
                 sys.stdout.write("\n")
                 from .gui import run_gui
                 return run_gui()
             elif key == "ENTER":
-                termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+                _restore_tty()
                 chosen = PRESET_ORDER[selected_idx]
                 new_cfg = IconConfig(
                     mode="preset",
@@ -265,7 +334,7 @@ def run_tui(refresh_dock: bool = False) -> int:
                 )
                 return _apply_with_progress(new_cfg, chosen, refresh_dock)
             elif key in ("f", "F"):
-                termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+                _restore_tty()
                 chosen_file = _pick_file_via_finder()
                 if chosen_file:
                     new_cfg = IconConfig(
@@ -278,18 +347,18 @@ def run_tui(refresh_dock: bool = False) -> int:
                         scale=cfg.scale,
                     )
                     return _apply_with_progress(new_cfg, chosen_file, refresh_dock)
-                status_msg = "Finder file selection cancelled."
-                tty.setraw(fd)
+                status_msg = "File selection cancelled."
+                _set_raw()
             elif key in ("c", "C"):
-                termios.tcsetattr(fd, termios.TCSANOW, old_tty)
-                sys.stdout.write("\nEnter custom icon path (.svg/.png/.icns/.jpg/.webp): ")
+                _restore_tty()
+                sys.stdout.write("\nEnter custom icon path (.svg/.png/.icns/.ico/.jpg/.webp): ")
                 sys.stdout.flush()
                 entered = sys.stdin.readline().strip().strip("'\"")
                 if entered:
                     p = Path(entered).expanduser()
                     if not p.exists():
                         status_msg = f"File not found: {p}"
-                        tty.setraw(fd)
+                        _set_raw()
                         continue
                     new_cfg = IconConfig(
                         mode="custom",
@@ -302,6 +371,6 @@ def run_tui(refresh_dock: bool = False) -> int:
                     )
                     return _apply_with_progress(new_cfg, str(p), refresh_dock)
                 status_msg = "No path entered."
-                tty.setraw(fd)
+                _set_raw()
     finally:
-        termios.tcsetattr(fd, termios.TCSANOW, old_tty)
+        _restore_tty()

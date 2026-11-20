@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from .config import (
     HERMES_APP,
     HERMES_REPO,
     WEB_DIST_FAVICON,
+    discover_windows_app_dirs,
 )
 
 
@@ -72,6 +74,18 @@ def _backup_targets(
         app_icns = applications_app / "Contents" / "Resources" / "icon.icns"
         if app_icns.exists():
             items.append(("applications_hermes_app/Contents/Resources/icon.icns", app_icns))
+    for wdir in discover_windows_app_dirs(repo):
+        wres = wdir / "resources"
+        prefix = f"win_app/{wdir.name}/resources"
+        for sub, p in (
+            ("icon.ico", wres / "icon.ico"),
+            ("app.asar", wres / "app.asar"),
+            ("app.asar.unpacked/dist/apple-touch-icon.png", wres / "app.asar.unpacked" / "dist" / "apple-touch-icon.png"),
+            ("app.asar.unpacked/dist/nous-girl.png", wres / "app.asar.unpacked" / "dist" / "nous-girl.png"),
+            ("app.asar.unpacked/dist/nous-girl-dark.png", wres / "app.asar.unpacked" / "dist" / "nous-girl-dark.png"),
+        ):
+            if p.exists():
+                items.append((f"{prefix}/{sub}", p))
     return items
 
 
@@ -184,8 +198,8 @@ def restore_original_icons(
                     replacements[sub_rel] = p.read_bytes()
             patch_asar(asar_path, replacements, info_plist_path=info_plist)
 
-    # Re-sign Hermes.app if present
-    if hermes_app.exists():
+    # Re-sign Hermes.app on macOS if present
+    if sys.platform == "darwin" and hermes_app.exists() and Path("/usr/bin/codesign").exists():
         cmd = [
             "/usr/bin/codesign",
             "--force",
