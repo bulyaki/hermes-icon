@@ -1,0 +1,48 @@
+#!/bin/sh
+set -eu
+
+# Resolve symlinks to find the repository root dynamically
+SELF="$0"
+while [ -L "$SELF" ]; do
+    DIR=$(cd -P "$(dirname "$SELF")" && pwd)
+    TARGET=$(readlink "$SELF")
+    case "$TARGET" in
+        /*) SELF="$TARGET" ;;
+        *) SELF="$DIR/$TARGET" ;;
+    esac
+done
+APP_ROOT=$(cd -P "$(dirname "$SELF")/.." && pwd)
+
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+HERMES_INSTALLS="$HERMES_HOME/installs"
+
+resolve_python() {
+    # 1. Inspect $HERMES_HOME/installs/*/facts.json for packages.venv.environment
+    for facts in "$HERMES_INSTALLS"/*/facts.json; do
+        [ -f "$facts" ] || continue
+        env_dir=$(sed -n 's/.*"environment"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$facts" | head -n 1)
+        if [ -n "$env_dir" ] && [ -x "$env_dir/bin/python" ]; then
+            printf '%s\n' "$env_dir/bin/python"
+            return 0
+        fi
+    done
+
+    # 2. Fallback: search $HERMES_HOME/installs/*/environments/*/venv/bin/python
+    for py in "$HERMES_INSTALLS"/*/environments/*/venv/bin/python; do
+        if [ -x "$py" ]; then
+            printf '%s\n' "$py"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+HERMES_PY=$(resolve_python || true)
+if [ -z "$HERMES_PY" ]; then
+    echo "hermes-icon: could not locate active Hermes Python interpreter under $HERMES_INSTALLS" >&2
+    exit 1
+fi
+
+unset PYTHONPATH PYTHONHOME
+exec "$HERMES_PY" -I "$APP_ROOT/run.py" "$@"
