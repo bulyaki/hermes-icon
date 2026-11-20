@@ -102,19 +102,30 @@ def _cmd_set(args: argparse.Namespace) -> int:
     res = apply_icon(new_cfg, refresh_dock=args.refresh_dock)
     elapsed = time.monotonic() - t0
     label = new_cfg.preset if new_cfg.mode == "preset" else new_cfg.custom_path
+    target_kind = "Staged targets" if res["repo"].get("staged") else "Repo targets"
     print(f"Applied '{label}' across all surfaces in {elapsed:.2f}s:")
-    print(f"  - Repo targets : {res['repo']['targets_written']} ({res['repo']['check_stdout']})")
+    print(f"  - {target_kind:<14s}: {res['repo']['targets_written']} ({res['repo']['check_stdout']})")
     if res["hermes_app"].get("patched"):
         asar = res["hermes_app"]["asar"]
         car_state = "Assets.car" if res["hermes_app"].get("assets_car_compiled", True) else "Assets.car(skipped->icon.icns)"
         print(
-            f"  - Hermes.app   : {car_state}, icon.icns, icon.ico, app.asar "
+            f"  - Hermes.app    : {car_state}, icon.icns, icon.ico, app.asar "
             f"(packed={asar['packed_updated']}, unpacked={asar['unpacked_updated']}), codesign verified"
         )
     if res.get("windows_apps"):
         for w in res["windows_apps"]:
-            print(f"  - Windows app  : {w['path']} (patched={w['patched']})")
-    print(f"  - /Applications/Hermes.app icon.icns patched: {res['applications_hermes_app_patched']}")
+            print(
+                f"  - Windows app   : {w['path']} "
+                f"(patched={w['patched']}, msix_tiles={w.get('msix_tiles_updated', 0)})"
+            )
+    if sys.platform == "darwin" or res["applications_hermes_app_patched"]:
+        print(f"  - /Applications/Hermes.app icon.icns patched: {res['applications_hermes_app_patched']}")
+    if (
+        not res["hermes_app"].get("patched")
+        and not res.get("windows_apps")
+        and not res["applications_hermes_app_patched"]
+    ):
+        print("  - Warning       : No installed Hermes desktop app bundle was found to patch.")
     return 0
 
 

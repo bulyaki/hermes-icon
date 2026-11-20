@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import subprocess
 import sys
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
@@ -68,6 +69,69 @@ def resolve_hermes_home(
     return cands[0]
 
 
+def _query_windows_powershell_paths(ps_script: str) -> list[Path]:
+    """Run a read-only PowerShell snippet returning JSON string/list of filesystem paths."""
+    if sys.platform != "win32":
+        return []
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        if proc.returncode != 0 or not proc.stdout.strip():
+            return []
+        data = json.loads(proc.stdout.strip())
+    except Exception:
+        return []
+
+    raw_items = [data] if isinstance(data, str) else (data if isinstance(data, list) else [])
+    paths: list[Path] = []
+    for item in raw_items:
+        if isinstance(item, str) and item.strip():
+            paths.append(Path(item.strip()))
+    return paths
+
+
+def _query_windows_appx_locations() -> list[Path]:
+    """Return InstallLocation paths for installed Hermes/Nous MSIX packages via Get-AppxPackage."""
+    ps_script = (
+        "@(Get-AppxPackage | Where-Object { $_.Name -like '*Hermes*' -or $_.Publisher -like '*Nous*' } "
+        "| ForEach-Object { $_.InstallLocation }) | ConvertTo-Json -Compress"
+    )
+    return _query_windows_powershell_paths(ps_script)
+
+
+def _query_windows_running_hermes_dirs() -> list[Path]:
+    """Return parent directories of any running Hermes*.exe processes."""
+    ps_script = (
+        "@(Get-CimInstance Win32_Process | Where-Object { $_.Name -like '*Hermes*' -and $_.ExecutablePath } "
+        "| ForEach-Object { Split-Path -Parent $_.ExecutablePath }) | ConvertTo-Json -Compress"
+    )
+    return _query_windows_powershell_paths(ps_script)
+
+
+def _query_windows_shortcut_target_dirs() -> list[Path]:
+    """Return target parent directories for *Hermes*.lnk shortcuts in Start Menu & Desktop."""
+    ps_script = (
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$roots = @([Environment]::GetFolderPath('Desktop'), "
+        "(Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'), "
+        "(Join-Path $env:ProgramData 'Microsoft\\Windows\\Start Menu\\Programs')); "
+        "$out = @(); "
+        "foreach ($r in $roots) { "
+        "if ($r -and (Test-Path -LiteralPath $r)) { "
+        "Get-ChildItem -Path $r -Filter '*Hermes*.lnk' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { "
+        "$t = $ws.CreateShortcut($_.FullName).TargetPath; "
+        "if ($t) { $out += (Split-Path -Parent $t) } "
+        "} } }; "
+        "@($out) | ConvertTo-Json -Compress"
+    )
+    return _query_windows_powershell_paths(ps_script)
+
+
 def windows_packaged_app_candidates(
     *,
     environ: Mapping[str, str] | None = None,
@@ -79,11 +143,14 @@ def windows_packaged_app_candidates(
     local_app_data = env.get("LOCALAPPDATA", "").strip()
     local_base = Path(local_app_data) if local_app_data else (user_home / "AppData" / "Local")
     cands = [
+        local_base / "Programs" / "Hermes Agent",
         local_base / "Programs" / "Hermes",
+        local_base / "Hermes Agent",
         local_base / "hermes-desktop",
     ]
     program_files = env.get("ProgramFiles", "").strip()
     if program_files:
+        cands.append(Path(program_files) / "Hermes Agent")
         cands.append(Path(program_files) / "Hermes")
     return cands
 
@@ -102,7 +169,12 @@ def discover_packaged_payload_dirs(
     candidates: list[Path] = []
     if plat == "win32":
         for app_dir in windows_packaged_app_candidates(environ=env, home=user_home):
+            candidates.append(app_dir / "app" / "resources" / "agent-payload")
             candidates.append(app_dir / "resources" / "agent-payload")
+        if environ is None:
+            for loc in _query_windows_appx_locations():
+                candidates.append(loc / "app" / "resources" / "agent-payload")
+                candidates.append(loc / "resources" / "agent-payload")
         program_files = env.get("ProgramFiles", "").strip()
         if program_files:
             win_apps = Path(program_files) / "WindowsApps"
@@ -196,15 +268,70 @@ HERMES_APP = HERMES_REPO / "apps" / "desktop" / "release" / "mac-arm64" / "Herme
 APPLICATIONS_HERMES_APP = Path("/Applications/Hermes.app")
 
 
+def _has_windows_app_markers(directory: Path) -> bool:
+    if (directory / "resources" / "app.asar").exists():
+        return True
+    with contextlib.suppress(OSError):
+        if any(directory.glob("Hermes*.exe")):
+            return True
+    return False
+
+
+def _resolve_win_app_dir(cand: Path) -> Path | None:
+    """Resolve an Electron root or MSIX InstallLocation to the directory holding ``resources/``."""
+    with contextlib.suppress(OSError):
+        if not cand.is_dir():
+            return None
+        app_sub = cand / "app"
+        if app_sub.is_dir() and _has_windows_app_markers(app_sub):
+            return app_sub
+        if _has_windows_app_markers(cand):
+            return cand
+    return None
+
+
+def msix_assets_dir_for_win_app(win_app_dir: Path) -> Path | None:
+    """Return the MSIX ``assets/`` directory containing Start/Taskbar tiles if present."""
+    for cand in (win_app_dir / "assets", win_app_dir.parent / "assets"):
+        with contextlib.suppress(OSError):
+            if cand.is_dir() and (
+                (cand / "Square44x44Logo.png").exists() or (cand.parent / "AppxManifest.xml").exists()
+            ):
+                return cand
+    return None
+
+
+def windows_app_surface_labels(win_dirs: list[Path]) -> dict[Path, str]:
+    """Return unique human-readable surface labels for discovered Windows app directories."""
+    base_labels: dict[Path, str] = {}
+    counts: dict[str, int] = {}
+    for wdir in win_dirs:
+        base = f"{wdir.parent.name}/{wdir.name}" if wdir.name.lower() == "app" and wdir.parent.name else wdir.name
+        base_labels[wdir] = base
+        counts[base] = counts.get(base, 0) + 1
+
+    labels: dict[Path, str] = {}
+    for wdir in win_dirs:
+        base = base_labels[wdir]
+        if counts.get(base, 0) > 1 and wdir.parent.name and wdir.name.lower() != "app":
+            labels[wdir] = f"{wdir.parent.name}/{wdir.name}"
+        else:
+            labels[wdir] = base
+    return labels
+
+
 def discover_windows_app_dirs(
     repo: Path = HERMES_REPO,
     *,
     environ: Mapping[str, str] | None = None,
     home: Path | None = None,
+    platform: str | None = None,
 ) -> list[Path]:
-    """Return unpacked Windows Electron desktop app directories containing resources/app.asar or Hermes.exe."""
+    """Return unpacked or MSIX Windows Electron desktop app directories holding ``resources/``."""
     env = environ if environ is not None else os.environ
     user_home = home if home is not None else Path.home()
+    plat = platform if platform is not None else sys.platform
+
     candidates: list[Path] = [
         repo / "apps" / "desktop" / "release" / "win-unpacked",
         repo / "apps" / "desktop" / "release" / "win-arm64-unpacked",
@@ -220,15 +347,22 @@ def discover_windows_app_dirs(
             ]
         )
     candidates.extend(windows_packaged_app_candidates(environ=env, home=user_home))
+    if plat == "win32" and environ is None:
+        candidates.extend(_query_windows_appx_locations())
+        candidates.extend(_query_windows_running_hermes_dirs())
+        candidates.extend(_query_windows_shortcut_target_dirs())
 
     found: list[Path] = []
-    seen: set[Path] = set()
+    seen: set[str] = set()
     for cand in candidates:
-        if cand in seen or not cand.is_dir():
+        resolved = _resolve_win_app_dir(cand)
+        if resolved is None:
             continue
-        if (cand / "resources" / "app.asar").exists() or (cand / "Hermes.exe").exists():
-            seen.add(cand)
-            found.append(cand)
+        key = os.path.normcase(str(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(resolved)
     return found
 
 LAUNCHD_LABEL = "com.codeproquo.hermes-icon-replacer"

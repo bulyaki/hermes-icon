@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import errno
 import json
@@ -40,8 +41,10 @@ from .config import (
     ensure_dirs,
     load_config,
     load_state,
+    msix_assets_dir_for_win_app,
     save_config,
     save_state,
+    windows_app_surface_labels,
 )
 
 ACTIVE_LOCK_WINDOW_SECONDS = 300
@@ -345,15 +348,13 @@ def _tracked_surface_paths(
             surfaces["applications_hermes_app/Contents/Resources/icon.icns"] = icns
 
     resolved_win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
-    win_name_counts: dict[str, int] = {}
-    for wdir in resolved_win_dirs:
-        win_name_counts[wdir.name] = win_name_counts.get(wdir.name, 0) + 1
+    win_labels = windows_app_surface_labels(resolved_win_dirs)
 
     for wdir in resolved_win_dirs:
         wres = wdir / "resources"
         if not wres.is_dir():
             continue
-        label = f"{wdir.parent.name}/{wdir.name}" if win_name_counts.get(wdir.name, 0) > 1 else wdir.name
+        label = win_labels[wdir]
         prefix = f"win_app/{label}/resources"
         for rel, path in (
             (f"{prefix}/icon.ico", wres / "icon.ico"),
@@ -364,6 +365,12 @@ def _tracked_surface_paths(
         ):
             if path.exists():
                 surfaces[rel] = path
+        msix_assets = msix_assets_dir_for_win_app(wdir)
+        if msix_assets is not None:
+            for tile_name in ("Square44x44Logo.png", "Square150x150Logo.png"):
+                tile_p = msix_assets / tile_name
+                if tile_p.exists():
+                    surfaces[f"win_app/{label}/msix_assets/{tile_name}"] = tile_p
     return surfaces
 
 
@@ -555,56 +562,282 @@ def refresh_macos_icon_cache(
                 pass
 
 
+def _stop_windows_app_processes(win_app_dir: Path) -> list[str]:
+    """Stop running Hermes processes inside ``win_app_dir`` and return unique exes to relaunch."""
+    if sys.platform != "win32":
+        return []
+    dir_str = str(win_app_dir).replace("'", "''")
+    ps_script = (
+        f"$dir = '{dir_str}'; "
+        "$procs = @(Get-CimInstance Win32_Process | Where-Object { "
+        "$_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) "
+        f"-and $_.ProcessId -ne {os.getpid()} "
+        "-and $_.Name -notlike 'python*' "
+        "}); "
+        "$exes = @($procs | Where-Object { $_.Name -like '*Hermes*' } | Select-Object -ExpandProperty ExecutablePath -Unique); "
+        "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "@($exes) | ConvertTo-Json -Compress"
+    )
+    relaunch_exes: list[str] = []
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            data = json.loads(proc.stdout.strip())
+            raw = [data] if isinstance(data, str) else (data if isinstance(data, list) else [])
+            relaunch_exes = [s for s in raw if isinstance(s, str) and s.strip()]
+    except Exception:
+        pass
+
+    asar_path = win_app_dir / "resources" / "app.asar"
+    if asar_path.exists():
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                with asar_path.open("r+b"):
+                    break
+            except OSError as exc:
+                if getattr(exc, "winerror", None) == 32:
+                    time.sleep(0.2)
+                    continue
+                break
+    return relaunch_exes
+
+
+def _relaunch_windows_exes(exes: list[str]) -> None:
+    """Relaunch stopped Windows executables detached."""
+    if sys.platform != "win32" or not exes:
+        return
+    for exe in exes:
+        if not Path(exe).is_file():
+            continue
+        exe_q = exe.replace("'", "''")
+        ps_script = (
+            f"Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{{ CommandLine = '\"{exe_q}\"' }} | Out-Null"
+        )
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=8,
+            )
+            if proc.returncode == 0:
+                continue
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            creationflags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            subprocess.Popen(
+                [exe],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=creationflags,
+            )
+
+
+def _is_windows_dir_writable(directory: Path, probe_files: list[Path] | None = None) -> bool:
+    if not directory.is_dir():
+        return True
+    probe = directory / f".hermes-icon-write-test-{os.getpid()}"
+    try:
+        with probe.open("wb") as fh:
+            fh.write(b"")
+        probe.unlink(missing_ok=True)
+    except OSError:
+        with contextlib.suppress(OSError):
+            probe.unlink(missing_ok=True)
+        return False
+
+    for pf in probe_files or ():
+        if pf.exists():
+            try:
+                with pf.open("r+b"):
+                    pass
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) != 32:
+                    return False
+            except OSError:
+                pass
+    return True
+
+
+def _ensure_windows_writable(targets: list[Path], probe_files: list[Path] | None = None) -> None:
+    """Grant Users modify/full ACLs on protected WindowsApps directories (UAC-elevated if needed)."""
+    if sys.platform != "win32":
+        return
+    existing = [t for t in targets if t and t.exists()]
+    unwritable: list[Path] = []
+    for t in existing:
+        matching_probes = [pf for pf in (probe_files or ()) if pf.parent == t]
+        if not _is_windows_dir_writable(t, matching_probes):
+            unwritable.append(t)
+    if not unwritable:
+        return
+
+    quoted_targets = ", ".join("'" + str(t).replace("'", "''") + "'" for t in unwritable)
+    ps_script = (
+        f"$targets = @({quoted_targets});\n"
+        "foreach ($t in $targets) {\n"
+        "  if ($t -and (Test-Path -LiteralPath $t)) {\n"
+        "    & takeown.exe /F $t /A /R /D Y | Out-Null\n"
+        "    & icacls.exe $t /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q | Out-Null\n"
+        "  }\n"
+        "}\n"
+    )
+    b64_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
+
+    is_admin = False
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+
+    if is_admin:
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64_cmd],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    else:
+        elev_cmd = (
+            "Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait "
+            f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{b64_cmd}'"
+        )
+        subprocess.run(
+            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", elev_cmd],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+    still_blocked = [
+        str(t)
+        for t in unwritable
+        if not _is_windows_dir_writable(t, [pf for pf in (probe_files or ()) if pf.parent == t])
+    ]
+    if still_blocked:
+        raise PermissionError(
+            "Administrator permission is required to update WindowsApps package files at: "
+            + ", ".join(still_blocked)
+        )
+
+
 def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
-    """Patch an unpacked Windows Electron directory (resources/icon.ico, app.asar, unpacked dist)."""
+    """Patch a Windows Electron/MSIX directory (resources/icon.ico, app.asar, unpacked dist, MSIX tiles)."""
     res_dir = win_app_dir / "resources"
     if not res_dir.is_dir():
         return {"path": str(win_app_dir), "patched": False}
 
-    desktop_assets = repo / "apps" / "desktop" / "assets"
-    desktop_public = repo / "apps" / "desktop" / "public"
-    ico_src = desktop_assets / "icon.ico"
-    if ico_src.exists():
-        shutil.copy2(ico_src, res_dir / "icon.ico")
-
-    unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
-    if unpacked_dist.exists():
-        for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
-            src_png = desktop_public / fname
-            if src_png.exists():
-                shutil.copy2(src_png, unpacked_dist / fname)
+    msix_assets = msix_assets_dir_for_win_app(win_app_dir)
+    relaunch_exes: list[str] = []
+    if sys.platform == "win32":
+        relaunch_exes = _stop_windows_app_processes(win_app_dir)
+        acl_targets = [res_dir] + ([msix_assets] if msix_assets is not None else [])
+        _ensure_windows_writable(acl_targets, probe_files=[res_dir / "app.asar", res_dir / "icon.ico"])
 
     asar_res: dict[str, Any] | None = None
-    asar_path = res_dir / "app.asar"
-    if asar_path.exists():
-        replacements = _collect_asar_replacements(repo, asar_path)
-        asar_res = patch_asar(asar_path, replacements, info_plist_path=None)
-        ok, errs = verify_asar_integrity(
-            asar_path,
-            None,
-            unpacked_dir=res_dir / "app.asar.unpacked",
-            check_paths=list(replacements.keys()),
-        )
-        if not ok:
-            raise RuntimeError(f"Windows ASAR verification failed after patching {win_app_dir}: {errs}")
+    msix_tiles_updated = 0
+    try:
+        desktop_assets = repo / "apps" / "desktop" / "assets"
+        desktop_public = repo / "apps" / "desktop" / "public"
+        ico_src = desktop_assets / "icon.ico"
+        if ico_src.exists():
+            shutil.copy2(ico_src, res_dir / "icon.ico")
 
-    return {"path": str(win_app_dir), "patched": True, "asar": asar_res}
+        unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
+        if unpacked_dist.exists():
+            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+                src_png = desktop_public / fname
+                if src_png.exists():
+                    shutil.copy2(src_png, unpacked_dist / fname)
+
+        asar_path = res_dir / "app.asar"
+        if asar_path.exists():
+            replacements = _collect_asar_replacements(repo, asar_path)
+            asar_res = patch_asar(asar_path, replacements, info_plist_path=None)
+            ok, errs = verify_asar_integrity(
+                asar_path,
+                None,
+                unpacked_dir=res_dir / "app.asar.unpacked",
+                check_paths=list(replacements.keys()),
+            )
+            if not ok:
+                raise RuntimeError(f"Windows ASAR verification failed after patching {win_app_dir}: {errs}")
+
+        if msix_assets is not None:
+            appx_src_dir = desktop_assets / "appx"
+            if appx_src_dir.is_dir():
+                for png_src in sorted(appx_src_dir.glob("*.png")):
+                    shutil.copy2(png_src, msix_assets / png_src.name)
+                    msix_tiles_updated += 1
+    finally:
+        if relaunch_exes:
+            _relaunch_windows_exes(relaunch_exes)
+
+    return {
+        "path": str(win_app_dir),
+        "patched": True,
+        "asar": asar_res,
+        "msix_assets_dir": str(msix_assets) if msix_assets is not None else None,
+        "msix_tiles_updated": msix_tiles_updated,
+        "relaunched": relaunch_exes,
+    }
 
 
-def refresh_windows_icon_cache(icon_ico_path: Path) -> None:
-    """Refresh Windows icon cache and update Hermes.lnk shortcuts if present."""
+def refresh_windows_icon_cache(
+    icon_ico_path: Path,
+    *,
+    appx_manifest_paths: list[Path] | None = None,
+) -> None:
+    """Refresh Windows shell/MSIX icon caches and update Hermes.lnk shortcuts if present."""
     if sys.platform != "win32":
         return
-    try:
-        subprocess.run(
-            ["ie4uinit.exe", "-show"],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
+
+    with contextlib.suppress(Exception):
+        import ctypes
+
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0x0000, None, None)  # type: ignore[attr-defined]
+
+    for args in (["ie4uinit.exe", "-ClearIconCache"], ["ie4uinit.exe", "-show"]):
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                args,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            )
+
+    local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
+    if local_app_data:
+        app_icon_cache = (
+            Path(local_app_data)
+            / "Packages"
+            / "Microsoft.Windows.Search_cw5n1h2txyewy"
+            / "LocalState"
+            / "AppIconCache"
         )
-    except Exception:
-        pass
+        if app_icon_cache.is_dir():
+            for child in list(app_icon_cache.rglob("*")):
+                if child.is_file():
+                    with contextlib.suppress(OSError):
+                        child.unlink()
+
+    for manifest_p in appx_manifest_paths or ():
+        if manifest_p.exists():
+            with contextlib.suppress(OSError):
+                os.utime(manifest_p, None)
 
     if not icon_ico_path.exists():
         return
@@ -621,7 +854,7 @@ def refresh_windows_icon_cache(icon_ico_path: Path) -> None:
         "$sc.Save() "
         "} } }"
     )
-    try:
+    with contextlib.suppress(Exception):
         subprocess.run(
             ["powershell", "-NoProfile", "-Command", ps_script],
             stdin=subprocess.DEVNULL,
@@ -629,8 +862,6 @@ def refresh_windows_icon_cache(icon_ico_path: Path) -> None:
             stderr=subprocess.DEVNULL,
             timeout=5,
         )
-    except Exception:
-        pass
 
 
 def _cache_custom_files(cfg: IconConfig) -> IconConfig:
@@ -679,12 +910,14 @@ def _apply_icon_locked(
         if progress_cb is not None:
             progress_cb(step, total, msg)
 
+    win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
+
     # Always back up original files before first modification
     ensure_original_backup(
         repo=repo,
         hermes_app=hermes_app,
         applications_app=applications_app,
-        win_app_dirs=win_app_dirs,
+        win_app_dirs=win_dirs,
     )
     cfg = _cache_custom_files(cfg)
 
@@ -707,8 +940,9 @@ def _apply_icon_locked(
     if src_favicon.exists() and dst_favicon.parent.exists():
         shutil.copy2(src_favicon, dst_favicon)
 
-    # 2-4. Packaged Desktop App (Hermes.app)
+    # 2-4. Packaged Desktop App (Hermes.app on macOS, or Windows Electron/MSIX packages)
     app_res: dict[str, Any] = {"patched": False}
+    win_results: list[dict[str, Any]] = []
     if hermes_app.exists():
         _wait_for_app_stability(hermes_app)
         res_dir = hermes_app / "Contents" / "Resources"
@@ -749,6 +983,13 @@ def _apply_icon_locked(
             "asar": asar_res,
             "codesign_verified": True,
         }
+        if win_dirs:
+            win_results = [patch_windows_app_dir(wdir, asset_root) for wdir in win_dirs]
+    elif win_dirs:
+        emit(2, 4, f"Preparing Windows Hermes Agent package ({win_dirs[0]})...")
+        emit(3, 4, "Patching Windows Hermes Agent (MSIX tiles, icon.ico & app.asar)...")
+        win_results = [patch_windows_app_dir(wdir, asset_root) for wdir in win_dirs]
+        emit(4, 4, "Refreshing Windows shell icon cache...")
     else:
         emit(4, 4, "Refreshing icon cache...")
 
@@ -760,22 +1001,23 @@ def _apply_icon_locked(
         shutil.copy2(src_icns, apps_icns)
         apps_patched = True
 
-    # 4b. Windows unpacked Electron app dirs (if present)
-    win_dirs = win_app_dirs if win_app_dirs is not None else discover_windows_app_dirs(repo)
-    win_results = [patch_windows_app_dir(wdir, asset_root) for wdir in win_dirs]
-
     # 5. Refresh OS icon caches
     refresh_paths = [hermes_app]
     if apps_patched:
         refresh_paths.append(applications_app)
     refresh_macos_icon_cache(refresh_paths, refresh_dock=refresh_dock)
     win_ico = asset_root / "apps" / "desktop" / "assets" / "icon.ico"
+    appx_manifests: list[Path] = []
     if win_dirs:
         cand_ico = win_dirs[0] / "resources" / "icon.ico"
         if cand_ico.exists():
             win_ico = cand_ico
+        for wdir in win_dirs:
+            for mf in (wdir / "AppxManifest.xml", wdir.parent / "AppxManifest.xml"):
+                if mf.exists():
+                    appx_manifests.append(mf)
     if win_results or sys.platform == "win32":
-        refresh_windows_icon_cache(win_ico)
+        refresh_windows_icon_cache(win_ico, appx_manifest_paths=appx_manifests)
 
     if save_active_config:
         cfg.watch_paused = False

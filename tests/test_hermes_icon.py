@@ -50,11 +50,13 @@ from hermes_icon.config import (
     HERMES_APP,
     HERMES_REPO,
     IconConfig,
+    _resolve_win_app_dir,
     candidate_hermes_homes,
     discover_packaged_payload_dirs,
     discover_windows_app_dirs,
     load_config,
     load_state,
+    msix_assets_dir_for_win_app,
     resolve_hermes_home,
     save_state,
 )
@@ -400,12 +402,12 @@ class TestLockAndWatcherConfig(unittest.TestCase):
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.3")
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.4")
 
     def test_windows_task_scheduler_and_cmd_launcher(self) -> None:
         self.assertTrue(BIN_HERMES_ICON_CMD.is_file())
         cmd_text = BIN_HERMES_ICON_CMD.read_text(encoding="utf-8")
-        self.assertIn("hermes-icon 0.1.3", cmd_text)
+        self.assertIn("hermes-icon 0.1.4", cmd_text)
         self.assertIn("run.py", cmd_text)
         self.assertIn("LOCALAPPDATA", cmd_text)
         self.assertIn("agent-payload", cmd_text)
@@ -416,7 +418,7 @@ class TestLockAndWatcherConfig(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="hermes-scoop-path-") as tmp:
             scoop_root = Path(tmp) / "scoop" / "apps" / "hermes-icon"
-            ver_bin = scoop_root / "0.1.3" / "bin"
+            ver_bin = scoop_root / "0.1.4" / "bin"
             cur_bin = scoop_root / "current" / "bin"
             ver_bin.mkdir(parents=True)
             cur_bin.mkdir(parents=True)
@@ -903,6 +905,111 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
                 run_mod.subprocess.run = orig_run
                 run_mod._probe_python = orig_probe
                 run_mod._find_uv_binary = orig_find_uv
+
+    def test_msix_package_discovery_patching_and_progress_steps(self) -> None:
+        asar_src = HERMES_APP / "Contents" / "Resources" / "app.asar"
+        if not asar_src.exists():
+            self.skipTest("Hermes.app app.asar not present")
+
+        with tempfile.TemporaryDirectory(prefix="hermes-msix-test-") as tmp:
+            root = Path(tmp)
+            missing_repo = root / "no-hermes-agent"
+            state_dir = root / "state"
+            msix_root = root / "WindowsApps" / "NousResearch.HermesBundled_1.0.0.0_x64__abc"
+            app_dir = msix_root / "app"
+            wres = app_dir / "resources"
+            unpacked_dist = wres / "app.asar.unpacked" / "dist"
+            msix_assets = msix_root / "assets"
+            unpacked_dist.mkdir(parents=True)
+            msix_assets.mkdir(parents=True)
+
+            (msix_root / "AppxManifest.xml").write_text("<Package/>", encoding="utf-8")
+            (app_dir / "Hermes Agent.exe").write_bytes(b"MZ")
+            (wres / "icon.ico").write_bytes(b"ORIG_MSIX_ICO")
+            shutil.copy2(asar_src, wres / "app.asar")
+            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+                (unpacked_dist / fname).write_bytes(b"ORIG_MSIX_DIST")
+
+            # Seed placeholder MSIX tiles that should all be replaced
+            for rel, kind, _ in DEFAULT_TARGETS:
+                if rel.startswith("apps/desktop/assets/appx/") and rel.endswith(".png"):
+                    (msix_assets / Path(rel).name).write_bytes(b"ORIG_TILE")
+
+            # Layout resolution: MSIX InstallLocation -> InstallLocation/app & InstallLocation/assets
+            self.assertEqual(_resolve_win_app_dir(msix_root), app_dir)
+            self.assertEqual(msix_assets_dir_for_win_app(app_dir), msix_assets)
+
+            import hermes_icon.config as cfg_mod
+            orig_appx = cfg_mod._query_windows_appx_locations
+            orig_procs = cfg_mod._query_windows_running_hermes_dirs
+            orig_lnk = cfg_mod._query_windows_shortcut_target_dirs
+            try:
+                cfg_mod._query_windows_appx_locations = lambda: [msix_root]
+                cfg_mod._query_windows_running_hermes_dirs = lambda: []
+                cfg_mod._query_windows_shortcut_target_dirs = lambda: []
+                found = discover_windows_app_dirs(missing_repo, environ=None, platform="win32")
+                self.assertIn(app_dir, found)
+            finally:
+                cfg_mod._query_windows_appx_locations = orig_appx
+                cfg_mod._query_windows_running_hermes_dirs = orig_procs
+                cfg_mod._query_windows_shortcut_target_dirs = orig_lnk
+
+            # Tracked surfaces should include MSIX resource & tile paths
+            tracked = _tracked_surface_paths(
+                repo=missing_repo,
+                hermes_app=root / "missing-Hermes.app",
+                applications_app=root / "missing-Applications-Hermes.app",
+                win_app_dirs=[app_dir],
+            )
+            msix_prefix = f"win_app/{msix_root.name}/app"
+            self.assertIn(f"{msix_prefix}/resources/app.asar", tracked)
+            self.assertIn(f"{msix_prefix}/msix_assets/Square44x44Logo.png", tracked)
+            self.assertIn(f"{msix_prefix}/msix_assets/Square150x150Logo.png", tracked)
+
+            # Isolated subprocess run verifying [1/4]..[4/4] progress, 62 MSIX PNGs, and restore
+            env = {
+                **os.environ,
+                "HOME": str(root),
+                "HERMES_HOME": str(root / ".hermes"),
+                "HERMES_REPO": str(missing_repo),
+                "HERMES_ICON_STATE_DIR": str(state_dir),
+                "PYTHONPATH": str(SRC_DIR),
+            }
+            script = (
+                "import json, sys\n"
+                "from pathlib import Path\n"
+                "from hermes_icon.applier import apply_icon, inspect_surfaces\n"
+                "from hermes_icon.backup import restore_original_icons\n"
+                "from hermes_icon.config import IconConfig\n"
+                "repo, app_dir, missing_app = map(Path, sys.argv[1:4])\n"
+                "steps = []\n"
+                "res = apply_icon(\n"
+                "    IconConfig(mode='preset', preset='shield'),\n"
+                "    repo=repo,\n"
+                "    hermes_app=missing_app,\n"
+                "    applications_app=missing_app,\n"
+                "    win_app_dirs=[app_dir],\n"
+                "    progress_cb=lambda s, t, m: steps.append([s, t, m]),\n"
+                ")\n"
+                "surf = inspect_surfaces(repo=repo, hermes_app=missing_app, applications_app=missing_app, win_app_dirs=[app_dir])\n"
+                "rest = restore_original_icons(repo=repo, hermes_app=missing_app, applications_app=missing_app)\n"
+                "print(json.dumps({'steps': steps, 'res': res, 'surf': surf, 'rest': rest}))\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", script, str(missing_repo), str(app_dir), str(root / "missing-Hermes.app")],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, f"stdout={proc.stdout}\nstderr={proc.stderr}")
+            out = json.loads(proc.stdout)
+            self.assertEqual([s[:2] for s in out["steps"]], [[1, 4], [2, 4], [3, 4], [4, 4]])
+            win_res = out["res"]["windows_apps"][0]
+            self.assertTrue(win_res["patched"])
+            self.assertEqual(win_res["msix_tiles_updated"], 62)
+            self.assertFalse(out["surf"]["needs_apply"])
+            self.assertEqual((wres / "icon.ico").read_bytes(), b"ORIG_MSIX_ICO")
+            self.assertEqual((msix_assets / "Square44x44Logo.png").read_bytes(), b"ORIG_TILE")
 
 
 if __name__ == "__main__":

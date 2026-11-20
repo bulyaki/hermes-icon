@@ -249,9 +249,20 @@ def _apply_with_progress(new_cfg: IconConfig, label: str, refresh_dock: bool) ->
 
     res = apply_icon(new_cfg, refresh_dock=refresh_dock, progress_cb=_progress)
     elapsed = time.monotonic() - t0
-    print(
-        f"Done in {elapsed:.2f}s! {res['repo']['targets_written']} repo targets + Hermes.app updated."
-    )
+    targets_n = res["repo"]["targets_written"]
+    win_apps = [w for w in res.get("windows_apps", []) if w.get("patched")]
+    if res.get("hermes_app", {}).get("patched"):
+        print(f"Done in {elapsed:.2f}s! {targets_n} icon targets + Hermes.app updated.")
+    elif win_apps:
+        paths = ", ".join(w["path"] for w in win_apps)
+        print(f"Done in {elapsed:.2f}s! {targets_n} icon targets + Windows Hermes Agent ({paths}) updated.")
+    elif res.get("applications_hermes_app_patched"):
+        print(f"Done in {elapsed:.2f}s! {targets_n} icon targets + /Applications/Hermes.app updated.")
+    else:
+        print(
+            f"Done in {elapsed:.2f}s! {targets_n} icon targets rendered, "
+            "but no installed Hermes desktop app bundle was found."
+        )
     return 0
 
 
