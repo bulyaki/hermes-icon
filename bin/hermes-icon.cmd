@@ -2,11 +2,11 @@
 setlocal enabledelayedexpansion
 
 if "%~1"=="--version" (
-  echo hermes-icon 0.1.5
+  echo hermes-icon 0.1.6
   exit /b 0
 )
 if "%~1"=="-V" (
-  echo hermes-icon 0.1.5
+  echo hermes-icon 0.1.6
   exit /b 0
 )
 
@@ -17,6 +17,10 @@ if defined HERMES_PYTHON (
 
 if not defined PY if defined HERMES_ICON_STATE_DIR (
   if exist "%HERMES_ICON_STATE_DIR%\.venv\Scripts\python.exe" set "PY=%HERMES_ICON_STATE_DIR%\.venv\Scripts\python.exe"
+)
+
+if not defined PY if defined USERPROFILE (
+  if exist "%USERPROFILE%\.hermes\icon-replacer\.venv\Scripts\python.exe" set "PY=%USERPROFILE%\.hermes\icon-replacer\.venv\Scripts\python.exe"
 )
 
 if not defined PY if defined HERMES_HOME (

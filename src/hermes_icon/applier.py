@@ -35,6 +35,7 @@ from .config import (
     HERMES_UPDATE_MARKER,
     LOGS_DIR,
     REPLACER_LOCK_PATH,
+    REPLACER_ROOT,
     STAGED_REPO_DIR,
     IconConfig,
     discover_windows_app_dirs,
@@ -647,6 +648,18 @@ def _ps_quote(value: str | Path) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def _make_unvirtualized_stage_dir(prefix: str = "stage-") -> Path:
+    """Create a temporary staging directory under ``REPLACER_ROOT / 'tmp'``.
+
+    Keeping staging under ``~/.hermes/icon-replacer/tmp`` avoids Windows Store
+    AppData/Temp virtualization (``wcifs.sys``) so elevated native processes
+    see the exact same files written by Store Python.
+    """
+    tmp_root = REPLACER_ROOT / "tmp"
+    tmp_root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=str(tmp_root)))
+
+
 def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
     """Return ``(recursive_dirs, non_recursive_dirs, target_files)`` for a Windows app dir.
 
@@ -658,7 +671,10 @@ def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[
     msix_assets = msix_assets_dir_for_win_app(win_app_dir)
 
     recursive_dirs = [msix_assets] if msix_assets is not None else []
-    non_recursive_dirs = [res_dir, unpacked_dir, unpacked_dist]
+    non_recursive_dirs: list[Path] = []
+    if msix_assets is not None and msix_assets == win_app_dir.parent / "assets":
+        non_recursive_dirs.append(win_app_dir.parent)
+    non_recursive_dirs.extend([win_app_dir, res_dir, unpacked_dir, unpacked_dist])
     target_files = [
         res_dir / "icon.ico",
         res_dir / "app.asar",
@@ -672,6 +688,8 @@ def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[
 def _build_windows_acl_ps_script(
     win_app_dir: Path,
     copy_pairs: list[tuple[Path, Path]] | None = None,
+    *,
+    err_log: Path | None = None,
 ) -> str:
     """Build PowerShell ACL + copy script touching only icon/asar targets (never agent-payload)."""
     recursive_dirs, non_recursive_dirs, target_files = _windows_acl_scope(win_app_dir)
@@ -683,62 +701,95 @@ def _build_windows_acl_ps_script(
         f"@{{ Src = {_ps_quote(src)}; Dst = {_ps_quote(dst)} }}"
         for src, dst in (copy_pairs or ())
     )
+    err_log_path = err_log or (REPLACER_ROOT / "tmp" / "elevated-error.log")
 
     lines = [
-        "$ErrorActionPreference = 'Stop'",
-        f"$recDirs = @({rec_arr})",
-        "foreach ($d in $recDirs) {",
-        "  if ($d -and (Test-Path -LiteralPath $d)) {",
-        "    & takeown.exe /F $d /A /R /D Y | Out-Null",
-        "    & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q | Out-Null",
-        "    Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R $_.FullName | Out-Null }",
+        "$ErrorActionPreference = 'Continue'",
+        f"$errLog = {_ps_quote(err_log_path)}",
+        "try {",
+        f"  $recDirs = @({rec_arr})",
+        "  foreach ($d in $recDirs) {",
+        "    if ($d -and (Test-Path -LiteralPath $d)) {",
+        "      & takeown.exe /F $d /A /R /D Y 2>$null | Out-Null",
+        "      & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q 2>$null | Out-Null",
+        "      Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R $_.FullName 2>$null | Out-Null }",
+        "    }",
         "  }",
-        "}",
-        f"$dirs = @({dir_arr})",
-        "foreach ($d in $dirs) {",
-        "  if ($d -and (Test-Path -LiteralPath $d)) {",
-        "    & takeown.exe /F $d /A | Out-Null",
-        "    & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /C /Q | Out-Null",
+        f"  $dirs = @({dir_arr})",
+        "  foreach ($d in $dirs) {",
+        "    if ($d -and (Test-Path -LiteralPath $d)) {",
+        "      & takeown.exe /F $d /A 2>$null | Out-Null",
+        "      & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /C /Q 2>$null | Out-Null",
+        "    }",
         "  }",
-        "}",
-        f"$files = @({file_arr})",
-        "foreach ($f in $files) {",
-        "  if ($f -and (Test-Path -LiteralPath $f)) {",
-        "    & takeown.exe /F $f /A | Out-Null",
-        "    & icacls.exe $f /grant '*S-1-5-32-545:F' /grant '*S-1-5-32-544:F' /grant '*S-1-15-2-1:RX' /grant '*S-1-15-2-2:RX' /C /Q | Out-Null",
-        "    & attrib.exe -R $f | Out-Null",
+        f"  $files = @({file_arr})",
+        "  foreach ($f in $files) {",
+        "    if ($f -and (Test-Path -LiteralPath $f)) {",
+        "      & takeown.exe /F $f /A 2>$null | Out-Null",
+        "      & icacls.exe $f /grant '*S-1-5-32-545:F' /grant '*S-1-5-32-544:F' /grant '*S-1-15-2-1:RX' /grant '*S-1-15-2-2:RX' /C /Q 2>$null | Out-Null",
+        "      & attrib.exe -R $f 2>$null | Out-Null",
+        "    }",
         "  }",
-        "}",
     ]
     if copy_pairs:
         lines.extend(
             [
-                f"$copies = @({copy_entries})",
-                "foreach ($c in $copies) {",
-                "  if (Test-Path -LiteralPath $c.Src) {",
-                "    $parent = Split-Path -Parent $c.Dst",
-                "    if ($parent -and -not (Test-Path -LiteralPath $parent)) {",
-                "      New-Item -ItemType Directory -Force -Path $parent | Out-Null",
+                f"  $copies = @({copy_entries})",
+                "  foreach ($c in $copies) {",
+                "    if (Test-Path -LiteralPath $c.Src) {",
+                "      $parent = Split-Path -Parent $c.Dst",
+                "      if ($parent -and -not (Test-Path -LiteralPath $parent)) {",
+                "        New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null",
+                "      }",
+                "      if (Test-Path -LiteralPath $c.Dst) {",
+                "        & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
+                "        Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
+                "        if (Test-Path -LiteralPath $c.Dst) {",
+                "          $old = \"$($c.Dst).old\"",
+                "          Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
+                "          Move-Item -LiteralPath $c.Dst -Destination $old -Force -ErrorAction SilentlyContinue",
+                "          Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
+                "        }",
+                "      }",
+                "      Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
                 "    }",
-                "    Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force",
                 "  }",
-                "}",
             ]
         )
+    lines.extend(
+        [
+            "} catch {",
+            "  ($_ | Out-String) | Set-Content -LiteralPath $errLog -Encoding UTF8",
+            "  exit 1",
+            "}",
+        ]
+    )
     return "\n".join(lines) + "\n"
 
 
-def _run_windows_ps_script(ps_script: str, *, script_dir: Path | None = None, timeout: float = 60.0) -> None:
+def _run_windows_ps_script(
+    ps_script: str,
+    *,
+    script_dir: Path | None = None,
+    err_log: Path | None = None,
+    timeout: float = 60.0,
+) -> None:
     """Execute a PowerShell script directly if admin, or via a UAC-elevated PowerShell child."""
     tmp_dir: Path | None = None
     if script_dir is None:
-        tmp_dir = Path(tempfile.mkdtemp(prefix="hermes-win-ps-"))
-        ps1_path = tmp_dir / "apply.ps1"
+        tmp_dir = _make_unvirtualized_stage_dir("hermes-win-ps-")
+        work_dir = tmp_dir
     else:
-        ps1_path = script_dir / "apply.ps1"
+        work_dir = script_dir
+    ps1_path = work_dir / "apply.ps1"
+    log_path = err_log or (work_dir / "elevated-error.log")
 
     try:
         ps1_path.write_text(ps_script, encoding="utf-8-sig")
+        if log_path.exists():
+            with contextlib.suppress(OSError):
+                log_path.unlink()
+
         is_admin = False
         with contextlib.suppress(Exception):
             import ctypes
@@ -754,7 +805,11 @@ def _run_windows_ps_script(ps_script: str, *, script_dir: Path | None = None, ti
                 timeout=timeout,
             )
             if proc.returncode != 0:
-                raise RuntimeError(f"Elevated Windows ACL/copy script failed (rc={proc.returncode}): {proc.stderr or proc.stdout}")
+                err_detail = ""
+                if log_path.is_file():
+                    err_detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                detail = err_detail or (proc.stderr or proc.stdout).strip()
+                raise RuntimeError(f"Elevated Windows ACL/copy script failed (rc={proc.returncode}): {detail}")
         else:
             ps1_q = _ps_quote(ps1_path)
             elev_cmd = (
@@ -770,9 +825,13 @@ def _run_windows_ps_script(ps_script: str, *, script_dir: Path | None = None, ti
                 timeout=timeout,
             )
             if proc.returncode != 0:
+                err_detail = ""
+                if log_path.is_file():
+                    err_detail = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                detail = err_detail or (proc.stderr or proc.stdout).strip()
                 raise PermissionError(
                     "Administrator permission is required to update WindowsApps package files "
-                    f"(rc={proc.returncode}): {proc.stderr or proc.stdout}"
+                    f"(rc={proc.returncode}): {detail}"
                 )
     finally:
         if tmp_dir is not None:
@@ -797,16 +856,28 @@ def _apply_windows_copy_pairs(
         if sys.platform != "win32":
             raise
 
-    ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=copy_pairs)
-    _run_windows_ps_script(ps_script, script_dir=stage_dir)
+    work_dir = stage_dir or _make_unvirtualized_stage_dir("hermes-win-ps-")
+    cleanup_work = stage_dir is None
+    err_log = work_dir / "elevated-error.log"
+    try:
+        ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=copy_pairs, err_log=err_log)
+        _run_windows_ps_script(ps_script, script_dir=work_dir, err_log=err_log)
+    finally:
+        if cleanup_work:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _ensure_windows_writable(win_app_dir: Path) -> None:
     """Ensure minimal targeted ACLs on ``win_app_dir`` without touching ``agent-payload``."""
     if sys.platform != "win32":
         return
-    ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=None)
-    _run_windows_ps_script(ps_script)
+    work_dir = _make_unvirtualized_stage_dir("hermes-win-ps-")
+    err_log = work_dir / "elevated-error.log"
+    try:
+        ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=None, err_log=err_log)
+        _run_windows_ps_script(ps_script, script_dir=work_dir, err_log=err_log)
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
@@ -827,7 +898,7 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
 
     asar_res: dict[str, Any] | None = None
     msix_tiles_updated = 0
-    stage_dir = Path(tempfile.mkdtemp(prefix="hermes-win-stage-"))
+    stage_dir = _make_unvirtualized_stage_dir("hermes-win-stage-")
     try:
         copy_pairs: list[tuple[Path, Path]] = []
         ico_src = desktop_assets / "icon.ico"

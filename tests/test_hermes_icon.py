@@ -61,6 +61,7 @@ from hermes_icon.config import (
     msix_assets_dir_for_win_app,
     resolve_hermes_home,
     resolve_hermes_repo,
+    resolve_replacer_root,
     save_state,
 )
 from hermes_icon.gui import start_gui_server
@@ -405,12 +406,12 @@ class TestLockAndWatcherConfig(unittest.TestCase):
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.5")
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.6")
 
     def test_windows_task_scheduler_and_cmd_launcher(self) -> None:
         self.assertTrue(BIN_HERMES_ICON_CMD.is_file())
         cmd_text = BIN_HERMES_ICON_CMD.read_text(encoding="utf-8")
-        self.assertIn("hermes-icon 0.1.5", cmd_text)
+        self.assertIn("hermes-icon 0.1.6", cmd_text)
         self.assertIn("run.py", cmd_text)
         self.assertIn("LOCALAPPDATA", cmd_text)
         self.assertIn("agent-payload", cmd_text)
@@ -421,7 +422,7 @@ class TestLockAndWatcherConfig(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="hermes-scoop-path-") as tmp:
             scoop_root = Path(tmp) / "scoop" / "apps" / "hermes-icon"
-            ver_bin = scoop_root / "0.1.5" / "bin"
+            ver_bin = scoop_root / "0.1.6" / "bin"
             cur_bin = scoop_root / "current" / "bin"
             ver_bin.mkdir(parents=True)
             cur_bin.mkdir(parents=True)
@@ -1037,34 +1038,47 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             (res_dir / "icon.ico").write_bytes(b"ICO")
             shutil.copy2(asar_src, res_dir / "app.asar")
 
-            # 1. resolve_hermes_repo must NOT return WindowsApps/.../agent-payload/repo
+            # 1. resolve_hermes_repo must NOT return WindowsApps/.../agent-payload/repo,
+            #    and resolve_replacer_root must stay under ~/.hermes/icon-replacer (outside AppData\Local)
             env_win = {"LOCALAPPDATA": str(local_appdata), "ProgramFiles": str(program_files)}
             resolved_repo = resolve_hermes_repo(environ=env_win, home=user_home, platform="win32")
             self.assertNotIn("WindowsApps", str(resolved_repo))
             self.assertNotIn("agent-payload", str(resolved_repo))
             self.assertEqual(resolved_repo, local_appdata / "hermes" / "hermes-agent")
+            self.assertEqual(
+                resolve_replacer_root(environ=env_win, home=user_home, platform="win32"),
+                user_home / ".hermes" / "icon-replacer",
+            )
 
             # 2. ACL scope and generated PowerShell script must never traverse agent-payload or resources recursively
             rec_dirs, non_rec_dirs, files = _windows_acl_scope(app_dir)
             self.assertEqual(rec_dirs, [msix_assets])
-            self.assertEqual(non_rec_dirs, [res_dir, res_dir / "app.asar.unpacked", unpacked_dist])
+            self.assertEqual(
+                non_rec_dirs,
+                [msix_root, app_dir, res_dir, res_dir / "app.asar.unpacked", unpacked_dist],
+            )
             self.assertEqual(len(files), 5)
             self.assertTrue(all("agent-payload" not in str(p) for p in (*rec_dirs, *non_rec_dirs, *files)))
 
+            err_log_p = user_home / ".hermes" / "icon-replacer" / "tmp" / "elevated-error.log"
             ps_script = _build_windows_acl_ps_script(
                 app_dir,
                 copy_pairs=[(root / "staged.ico", res_dir / "icon.ico")],
+                err_log=err_log_p,
             )
             self.assertNotIn("agent-payload", ps_script)
+            self.assertIn("elevated-error.log", ps_script)
             rec_section = ps_script.split("$dirs = @")[0]
             dir_section = ps_script.split("$dirs = @")[1].split("$files = @")[0]
             file_section = ps_script.split("$files = @")[1].split("$copies = @")[0]
+            copy_section = ps_script.split("$copies = @")[1]
 
             # Recursive /R and /T appear ONLY in $recDirs (assets), never in $dirs (resources) or $files
             self.assertIn(str(msix_assets), rec_section)
             self.assertIn(" /R ", rec_section)
             self.assertIn(" /T ", rec_section)
             self.assertIn(str(res_dir), dir_section)
+            self.assertIn(str(msix_root), dir_section)
             self.assertNotIn(" /R ", dir_section)
             self.assertNotIn(" /T ", dir_section)
             self.assertNotIn(" /R ", file_section)
@@ -1072,9 +1086,11 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             self.assertNotIn("(OI)(CI)", file_section)
             self.assertIn("*S-1-5-32-545:F", file_section)
             self.assertIn("attrib.exe -R", file_section)
-            self.assertIn("Copy-Item", ps_script)
+            self.assertIn("Remove-Item", copy_section)
+            self.assertIn("Move-Item", copy_section)
+            self.assertIn("Copy-Item", copy_section)
 
-            # 3. patch_windows_app_dir must stage app.asar in temp before copying into resources/app.asar
+            # 3. patch_windows_app_dir must stage app.asar inside REPLACER_ROOT/tmp before copying
             fake_repo = root / "staged-repo"
             desktop_assets = fake_repo / "apps" / "desktop" / "assets"
             desktop_public = fake_repo / "apps" / "desktop" / "public"
@@ -1090,20 +1106,24 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
 
             import hermes_icon.applier as applier_mod
             orig_patch_asar = applier_mod.patch_asar
+            orig_replacer_root = applier_mod.REPLACER_ROOT
             patched_paths: list[Path] = []
+            test_replacer_root = user_home / ".hermes" / "icon-replacer"
 
             def _spy_patch_asar(asar_p: Path, replacements: dict[str, bytes], **kwargs):
                 patched_paths.append(asar_p)
                 return orig_patch_asar(asar_p, replacements, **kwargs)
 
             try:
+                applier_mod.REPLACER_ROOT = test_replacer_root
                 applier_mod.patch_asar = _spy_patch_asar
                 patch_windows_app_dir(app_dir, fake_repo)
             finally:
                 applier_mod.patch_asar = orig_patch_asar
+                applier_mod.REPLACER_ROOT = orig_replacer_root
 
             self.assertEqual(len(patched_paths), 1)
-            self.assertNotEqual(patched_paths[0].parent, res_dir)
+            self.assertEqual(patched_paths[0].parent.parent, test_replacer_root / "tmp")
             self.assertEqual((res_dir / "icon.ico").read_bytes(), b"NEW_ICO")
             self.assertFalse(list(res_dir.glob("*.tmp")))
 

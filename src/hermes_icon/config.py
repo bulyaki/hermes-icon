@@ -229,13 +229,14 @@ def resolve_replacer_root(
     home: Path | None = None,
     platform: str | None = None,
 ) -> Path:
-    """Resolve hermes-icon runtime state directory."""
+    """Resolve hermes-icon runtime state directory outside AppData virtualization."""
+    _ = hermes_home, platform
     env = environ if environ is not None else os.environ
     override = env.get("HERMES_ICON_STATE_DIR", "").strip()
     if override:
         return Path(override).expanduser()
-    base_home = hermes_home or resolve_hermes_home(environ=env, home=home, platform=platform)
-    return base_home / "icon-replacer"
+    user_home = home if home is not None else Path.home()
+    return user_home / ".hermes" / "icon-replacer"
 
 
 HERMES_HOME = resolve_hermes_home()

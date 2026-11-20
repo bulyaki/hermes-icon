@@ -153,7 +153,7 @@ def _find_python_and_sitedir() -> tuple[Path, Path | None] | None:
     site_dirs = _collect_site_dirs()
     if site_dirs:
         cur_py = Path(sys.executable)
-        tool_pythons = [cur_py, *[p for p in _collect_tools_pythons() if p not in seen]]
+        tool_pythons = [*[p for p in _collect_tools_pythons() if p not in seen], cur_py]
         for sp_dir in site_dirs:
             for py_cand in tool_pythons:
                 if _probe_python(py_cand, sp_dir):

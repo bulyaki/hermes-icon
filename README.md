@@ -127,11 +127,11 @@ hermes-icon restore
 
 ## Runtime State & Environment Variables
 
-Runtime configuration, backups, lockfiles, and logs are kept outside the source checkout in `%LOCALAPPDATA%\hermes\icon-replacer\` on Windows or `~/.hermes/icon-replacer/` on macOS/Linux (override with `HERMES_ICON_STATE_DIR`):
+Runtime configuration, backups, lockfiles, and logs are kept outside the source checkout in `~/.hermes/icon-replacer/` (`%USERPROFILE%\.hermes\icon-replacer\` on Windows; override with `HERMES_ICON_STATE_DIR`):
 
 - `HERMES_HOME`: Base Hermes directory (default on Windows: `%LOCALAPPDATA%\hermes`, falling back to `%USERPROFILE%\.hermes` if present; default on macOS/Linux: `~/.hermes`)
-- `HERMES_REPO`: Hermes repository path (default: `$HERMES_HOME/hermes-agent` or packaged `agent-payload/repo` when present)
-- `HERMES_ICON_STATE_DIR`: Runtime state directory (default: `$HERMES_HOME/icon-replacer`)
+- `HERMES_REPO`: Hermes repository path (default: `$HERMES_HOME/hermes-agent`)
+- `HERMES_ICON_STATE_DIR`: Runtime state directory (default: `~/.hermes/icon-replacer`)
 - `HERMES_PYTHON`: Optional explicit Python interpreter path override
 
 ## License
