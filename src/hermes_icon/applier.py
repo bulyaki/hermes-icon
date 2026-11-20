@@ -643,94 +643,170 @@ def _relaunch_windows_exes(exes: list[str]) -> None:
             )
 
 
-def _is_windows_dir_writable(directory: Path, probe_files: list[Path] | None = None) -> bool:
-    if not directory.is_dir():
-        return True
-    probe = directory / f".hermes-icon-write-test-{os.getpid()}"
+def _ps_quote(value: str | Path) -> str:
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
+    """Return ``(recursive_dirs, non_recursive_dirs, target_files)`` for a Windows app dir.
+
+    Never returns ``resources/agent-payload`` or sets recursive flags on ``resources/``.
+    """
+    res_dir = win_app_dir / "resources"
+    unpacked_dir = res_dir / "app.asar.unpacked"
+    unpacked_dist = unpacked_dir / "dist"
+    msix_assets = msix_assets_dir_for_win_app(win_app_dir)
+
+    recursive_dirs = [msix_assets] if msix_assets is not None else []
+    non_recursive_dirs = [res_dir, unpacked_dir, unpacked_dist]
+    target_files = [
+        res_dir / "icon.ico",
+        res_dir / "app.asar",
+        unpacked_dist / "apple-touch-icon.png",
+        unpacked_dist / "nous-girl.png",
+        unpacked_dist / "nous-girl-dark.png",
+    ]
+    return recursive_dirs, non_recursive_dirs, target_files
+
+
+def _build_windows_acl_ps_script(
+    win_app_dir: Path,
+    copy_pairs: list[tuple[Path, Path]] | None = None,
+) -> str:
+    """Build PowerShell ACL + copy script touching only icon/asar targets (never agent-payload)."""
+    recursive_dirs, non_recursive_dirs, target_files = _windows_acl_scope(win_app_dir)
+
+    rec_arr = ", ".join(_ps_quote(d) for d in recursive_dirs)
+    dir_arr = ", ".join(_ps_quote(d) for d in non_recursive_dirs)
+    file_arr = ", ".join(_ps_quote(f) for f in target_files)
+    copy_entries = ", ".join(
+        f"@{{ Src = {_ps_quote(src)}; Dst = {_ps_quote(dst)} }}"
+        for src, dst in (copy_pairs or ())
+    )
+
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        f"$recDirs = @({rec_arr})",
+        "foreach ($d in $recDirs) {",
+        "  if ($d -and (Test-Path -LiteralPath $d)) {",
+        "    & takeown.exe /F $d /A /R /D Y | Out-Null",
+        "    & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q | Out-Null",
+        "    Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R $_.FullName | Out-Null }",
+        "  }",
+        "}",
+        f"$dirs = @({dir_arr})",
+        "foreach ($d in $dirs) {",
+        "  if ($d -and (Test-Path -LiteralPath $d)) {",
+        "    & takeown.exe /F $d /A | Out-Null",
+        "    & icacls.exe $d /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-5-32-544:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /C /Q | Out-Null",
+        "  }",
+        "}",
+        f"$files = @({file_arr})",
+        "foreach ($f in $files) {",
+        "  if ($f -and (Test-Path -LiteralPath $f)) {",
+        "    & takeown.exe /F $f /A | Out-Null",
+        "    & icacls.exe $f /grant '*S-1-5-32-545:F' /grant '*S-1-5-32-544:F' /grant '*S-1-15-2-1:RX' /grant '*S-1-15-2-2:RX' /C /Q | Out-Null",
+        "    & attrib.exe -R $f | Out-Null",
+        "  }",
+        "}",
+    ]
+    if copy_pairs:
+        lines.extend(
+            [
+                f"$copies = @({copy_entries})",
+                "foreach ($c in $copies) {",
+                "  if (Test-Path -LiteralPath $c.Src) {",
+                "    $parent = Split-Path -Parent $c.Dst",
+                "    if ($parent -and -not (Test-Path -LiteralPath $parent)) {",
+                "      New-Item -ItemType Directory -Force -Path $parent | Out-Null",
+                "    }",
+                "    Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force",
+                "  }",
+                "}",
+            ]
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _run_windows_ps_script(ps_script: str, *, script_dir: Path | None = None, timeout: float = 60.0) -> None:
+    """Execute a PowerShell script directly if admin, or via a UAC-elevated PowerShell child."""
+    tmp_dir: Path | None = None
+    if script_dir is None:
+        tmp_dir = Path(tempfile.mkdtemp(prefix="hermes-win-ps-"))
+        ps1_path = tmp_dir / "apply.ps1"
+    else:
+        ps1_path = script_dir / "apply.ps1"
+
     try:
-        with probe.open("wb") as fh:
-            fh.write(b"")
-        probe.unlink(missing_ok=True)
-    except OSError:
-        with contextlib.suppress(OSError):
-            probe.unlink(missing_ok=True)
-        return False
+        ps1_path.write_text(ps_script, encoding="utf-8-sig")
+        is_admin = False
+        with contextlib.suppress(Exception):
+            import ctypes
 
-    for pf in probe_files or ():
-        if pf.exists():
-            try:
-                with pf.open("r+b"):
-                    pass
-            except PermissionError as exc:
-                if getattr(exc, "winerror", None) != 32:
-                    return False
-            except OSError:
-                pass
-    return True
+            is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
+
+        if is_admin:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                raise RuntimeError(f"Elevated Windows ACL/copy script failed (rc={proc.returncode}): {proc.stderr or proc.stdout}")
+        else:
+            ps1_q = _ps_quote(ps1_path)
+            elev_cmd = (
+                "$p = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru "
+                f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',{ps1_q}; "
+                "exit $p.ExitCode"
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", elev_cmd],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if proc.returncode != 0:
+                raise PermissionError(
+                    "Administrator permission is required to update WindowsApps package files "
+                    f"(rc={proc.returncode}): {proc.stderr or proc.stdout}"
+                )
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
-def _ensure_windows_writable(targets: list[Path], probe_files: list[Path] | None = None) -> None:
-    """Grant Users modify/full ACLs on protected WindowsApps directories (UAC-elevated if needed)."""
+def _apply_windows_copy_pairs(
+    win_app_dir: Path,
+    copy_pairs: list[tuple[Path, Path]],
+    *,
+    stage_dir: Path | None = None,
+) -> None:
+    """Copy staged files to ``win_app_dir``, escalating once via UAC only if PermissionError occurs."""
+    if not copy_pairs:
+        return
+    try:
+        for src, dst in copy_pairs:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+        return
+    except PermissionError:
+        if sys.platform != "win32":
+            raise
+
+    ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=copy_pairs)
+    _run_windows_ps_script(ps_script, script_dir=stage_dir)
+
+
+def _ensure_windows_writable(win_app_dir: Path) -> None:
+    """Ensure minimal targeted ACLs on ``win_app_dir`` without touching ``agent-payload``."""
     if sys.platform != "win32":
         return
-    existing = [t for t in targets if t and t.exists()]
-    unwritable: list[Path] = []
-    for t in existing:
-        matching_probes = [pf for pf in (probe_files or ()) if pf.parent == t]
-        if not _is_windows_dir_writable(t, matching_probes):
-            unwritable.append(t)
-    if not unwritable:
-        return
-
-    quoted_targets = ", ".join("'" + str(t).replace("'", "''") + "'" for t in unwritable)
-    ps_script = (
-        f"$targets = @({quoted_targets});\n"
-        "foreach ($t in $targets) {\n"
-        "  if ($t -and (Test-Path -LiteralPath $t)) {\n"
-        "    & takeown.exe /F $t /A /R /D Y | Out-Null\n"
-        "    & icacls.exe $t /grant '*S-1-5-32-545:(OI)(CI)F' /grant '*S-1-15-2-1:(OI)(CI)RX' /grant '*S-1-15-2-2:(OI)(CI)RX' /T /C /Q | Out-Null\n"
-        "  }\n"
-        "}\n"
-    )
-    b64_cmd = base64.b64encode(ps_script.encode("utf-16-le")).decode("ascii")
-
-    is_admin = False
-    with contextlib.suppress(Exception):
-        import ctypes
-
-        is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
-
-    if is_admin:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-EncodedCommand", b64_cmd],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-    else:
-        elev_cmd = (
-            "Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait "
-            f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','{b64_cmd}'"
-        )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", elev_cmd],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=120,
-        )
-
-    still_blocked = [
-        str(t)
-        for t in unwritable
-        if not _is_windows_dir_writable(t, [pf for pf in (probe_files or ()) if pf.parent == t])
-    ]
-    if still_blocked:
-        raise PermissionError(
-            "Administrator permission is required to update WindowsApps package files at: "
-            + ", ".join(still_blocked)
-        )
+    ps_script = _build_windows_acl_ps_script(win_app_dir, copy_pairs=None)
+    _run_windows_ps_script(ps_script)
 
 
 def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
@@ -740,32 +816,61 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
         return {"path": str(win_app_dir), "patched": False}
 
     msix_assets = msix_assets_dir_for_win_app(win_app_dir)
+    desktop_assets = repo / "apps" / "desktop" / "assets"
+    desktop_public = repo / "apps" / "desktop" / "public"
+    unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
+    asar_path = res_dir / "app.asar"
+
     relaunch_exes: list[str] = []
     if sys.platform == "win32":
         relaunch_exes = _stop_windows_app_processes(win_app_dir)
-        acl_targets = [res_dir] + ([msix_assets] if msix_assets is not None else [])
-        _ensure_windows_writable(acl_targets, probe_files=[res_dir / "app.asar", res_dir / "icon.ico"])
 
     asar_res: dict[str, Any] | None = None
     msix_tiles_updated = 0
+    stage_dir = Path(tempfile.mkdtemp(prefix="hermes-win-stage-"))
     try:
-        desktop_assets = repo / "apps" / "desktop" / "assets"
-        desktop_public = repo / "apps" / "desktop" / "public"
+        copy_pairs: list[tuple[Path, Path]] = []
         ico_src = desktop_assets / "icon.ico"
         if ico_src.exists():
-            shutil.copy2(ico_src, res_dir / "icon.ico")
+            copy_pairs.append((ico_src, res_dir / "icon.ico"))
 
-        unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
+        unpacked_names = ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png")
         if unpacked_dist.exists():
-            for fname in ("apple-touch-icon.png", "nous-girl.png", "nous-girl-dark.png"):
+            stage_unpacked_dist = stage_dir / "unpacked" / "dist"
+            stage_unpacked_dist.mkdir(parents=True, exist_ok=True)
+            for fname in unpacked_names:
                 src_png = desktop_public / fname
                 if src_png.exists():
-                    shutil.copy2(src_png, unpacked_dist / fname)
+                    staged_png = stage_unpacked_dist / fname
+                    shutil.copy2(src_png, staged_png)
+                    copy_pairs.append((staged_png, unpacked_dist / fname))
 
-        asar_path = res_dir / "app.asar"
+        replacements: dict[str, bytes] = {}
         if asar_path.exists():
-            replacements = _collect_asar_replacements(repo, asar_path)
-            asar_res = patch_asar(asar_path, replacements, info_plist_path=None)
+            staged_asar = stage_dir / "app.asar"
+            shutil.copy2(asar_path, staged_asar)
+            replacements = _collect_asar_replacements(repo, staged_asar)
+            asar_res = patch_asar(staged_asar, replacements, info_plist_path=None)
+            ok, errs = verify_asar_integrity(
+                staged_asar,
+                None,
+                unpacked_dir=(stage_dir / "unpacked") if unpacked_dist.exists() else None,
+                check_paths=list(replacements.keys()),
+            )
+            if not ok:
+                raise RuntimeError(f"Windows staged ASAR verification failed for {win_app_dir}: {errs}")
+            copy_pairs.append((staged_asar, asar_path))
+
+        if msix_assets is not None:
+            appx_src_dir = desktop_assets / "appx"
+            if appx_src_dir.is_dir():
+                for png_src in sorted(appx_src_dir.glob("*.png")):
+                    copy_pairs.append((png_src, msix_assets / png_src.name))
+                    msix_tiles_updated += 1
+
+        _apply_windows_copy_pairs(win_app_dir, copy_pairs, stage_dir=stage_dir)
+
+        if asar_path.exists():
             ok, errs = verify_asar_integrity(
                 asar_path,
                 None,
@@ -774,14 +879,8 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
             )
             if not ok:
                 raise RuntimeError(f"Windows ASAR verification failed after patching {win_app_dir}: {errs}")
-
-        if msix_assets is not None:
-            appx_src_dir = desktop_assets / "appx"
-            if appx_src_dir.is_dir():
-                for png_src in sorted(appx_src_dir.glob("*.png")):
-                    shutil.copy2(png_src, msix_assets / png_src.name)
-                    msix_tiles_updated += 1
     finally:
+        shutil.rmtree(stage_dir, ignore_errors=True)
         if relaunch_exes:
             _relaunch_windows_exes(relaunch_exes)
 
@@ -934,10 +1033,10 @@ def _apply_icon_locked(
     )
     asset_root = Path(repo_res.get("output_repo", str(repo)))
 
-    # Web UI favicon
+    # Web UI favicon (only when repo checkout is writable)
     src_favicon = asset_root / "web" / "public" / "favicon.ico"
     dst_favicon = repo / "hermes_cli" / "web_dist" / "favicon.ico"
-    if src_favicon.exists() and dst_favicon.parent.exists():
+    if src_favicon.exists() and dst_favicon.parent.is_dir() and os.access(dst_favicon.parent, os.W_OK):
         shutil.copy2(src_favicon, dst_favicon)
 
     # 2-4. Packaged Desktop App (Hermes.app on macOS, or Windows Electron/MSIX packages)

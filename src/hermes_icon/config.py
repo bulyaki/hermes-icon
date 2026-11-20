@@ -218,11 +218,6 @@ def resolve_hermes_repo(
         if cand_repo.is_dir():
             return cand_repo
 
-    for payload_dir in discover_packaged_payload_dirs(environ=env, home=home, platform=platform):
-        cand_repo = payload_dir / "repo"
-        if cand_repo.is_dir():
-            return cand_repo
-
     base_home = hermes_home or resolve_hermes_home(environ=env, home=home, platform=platform)
     return base_home / "hermes-agent"
 

@@ -179,65 +179,69 @@ def restore_original_icons(
             if proc.returncode != 0:
                 raise RuntimeError(f"generate_icons.py restore failed: {proc.stdout}\n{proc.stderr}")
 
-    # 2. Prepare Windows packaged dirs if restoring win_app entries
+    # 2. Restore exact backed-up files (web_dist, Hermes.app, /Applications/Hermes.app, Windows apps)
     win_dirs_to_relaunch: list[str] = []
-    win_dirs: list[Path] = []
-    if sys.platform == "win32" and any(k.startswith("win_app/") for k in manifest.get("files", {})):
+    has_win_entries = any(k.startswith("win_app/") for k in manifest.get("files", {}))
+    win_dirs: list[Path] = discover_windows_app_dirs(repo) if has_win_entries else []
+    win_pairs_by_dir: dict[Path, list[tuple[Path, Path]]] = {}
+    other_pairs: list[tuple[Path, Path]] = []
+
+    for rel, meta in manifest.get("files", {}).items():
+        if rel in ("repo/assets/nous-girl-black.svg", "repo/assets/nous-girl-white.svg"):
+            continue
+        src = backup_dir / rel
+        if not src.exists():
+            continue
+        if rel.startswith("repo/"):
+            dst = repo / rel.removeprefix("repo/")
+        elif rel.startswith("hermes_app/"):
+            dst = hermes_app / rel.removeprefix("hermes_app/")
+        elif rel.startswith("applications_hermes_app/"):
+            dst = applications_app / rel.removeprefix("applications_hermes_app/")
+        else:
+            dst = Path(meta["source_path"])
+        if not dst.parent.exists():
+            continue
+        if rel.startswith("win_app/"):
+            owner = next(
+                (w for w in win_dirs if dst == w or w in dst.parents or (w.parent / "assets") in (dst, dst.parent)),
+                win_dirs[0] if win_dirs else dst.parent,
+            )
+            win_pairs_by_dir.setdefault(owner, []).append((src, dst))
+        else:
+            other_pairs.append((src, dst))
+
+    for src, dst in other_pairs:
+        shutil.copy2(src, dst)
+        restored.append(str(dst))
+
+    if win_pairs_by_dir:
         from .applier import (
-            _ensure_windows_writable,
+            _apply_windows_copy_pairs,
             _relaunch_windows_exes,
             _stop_windows_app_processes,
             refresh_windows_icon_cache,
         )
 
-        win_dirs = discover_windows_app_dirs(repo)
-        for wdir in win_dirs:
-            win_dirs_to_relaunch.extend(_stop_windows_app_processes(wdir))
-            acl_targets = [wdir / "resources"]
-            msix_assets = msix_assets_dir_for_win_app(wdir)
-            if msix_assets is not None:
-                acl_targets.append(msix_assets)
-            _ensure_windows_writable(
-                acl_targets,
-                probe_files=[wdir / "resources" / "app.asar", wdir / "resources" / "icon.ico"],
-            )
+        try:
+            for wdir, pairs in win_pairs_by_dir.items():
+                if sys.platform == "win32":
+                    win_dirs_to_relaunch.extend(_stop_windows_app_processes(wdir))
+                _apply_windows_copy_pairs(wdir, pairs)
+                restored.extend(str(dst) for _, dst in pairs)
+        finally:
+            if win_dirs_to_relaunch:
+                _relaunch_windows_exes(win_dirs_to_relaunch)
 
-    # 3. Restore exact backed-up files (web_dist, Hermes.app, /Applications/Hermes.app, Windows apps)
-    try:
-        for rel, meta in manifest.get("files", {}).items():
-            if rel in ("repo/assets/nous-girl-black.svg", "repo/assets/nous-girl-white.svg"):
-                continue
-            src = backup_dir / rel
-            if not src.exists():
-                continue
-            if rel.startswith("repo/"):
-                dst = repo / rel.removeprefix("repo/")
-            elif rel.startswith("hermes_app/"):
-                dst = hermes_app / rel.removeprefix("hermes_app/")
-            elif rel.startswith("applications_hermes_app/"):
-                dst = applications_app / rel.removeprefix("applications_hermes_app/")
-            else:
-                dst = Path(meta["source_path"])
-            if dst.parent.exists():
-                shutil.copy2(src, dst)
-                restored.append(str(dst))
-    finally:
-        if win_dirs_to_relaunch:
-            from .applier import _relaunch_windows_exes
-
-            _relaunch_windows_exes(win_dirs_to_relaunch)
-
-    if sys.platform == "win32" and win_dirs:
-        from .applier import refresh_windows_icon_cache
-
-        ico_p = win_dirs[0] / "resources" / "icon.ico"
-        manifests = [
-            mf
-            for wdir in win_dirs
-            for mf in (wdir / "AppxManifest.xml", wdir.parent / "AppxManifest.xml")
-            if mf.exists()
-        ]
-        refresh_windows_icon_cache(ico_p, appx_manifest_paths=manifests)
+        if sys.platform == "win32" and win_dirs:
+            ico_p = win_dirs[0] / "resources" / "icon.ico"
+            manifests = [
+                mf
+                for wdir in win_dirs
+                for mf in (wdir / "AppxManifest.xml", wdir.parent / "AppxManifest.xml")
+                if mf.exists()
+            ]
+            refresh_windows_icon_cache(ico_p, appx_manifest_paths=manifests)
 
     # Fallback if app.asar wasn't in backup for any reason: patch it from repo assets
     if "hermes_app/Contents/Resources/app.asar" not in manifest.get("files", {}) and hermes_app.exists():

@@ -147,8 +147,11 @@ def is_windows_task_registered() -> bool:
 
 
 def install_git_hooks(repo: Path = HERMES_REPO) -> list[str]:
-    hooks_dir = repo / ".git" / "hooks"
-    if not (repo / ".git").exists():
+    git_dir = repo / ".git"
+    hooks_dir = git_dir / "hooks"
+    if not git_dir.is_dir() or not os.access(git_dir, os.W_OK):
+        return []
+    if hooks_dir.exists() and not os.access(hooks_dir, os.W_OK):
         return []
     hooks_dir.mkdir(parents=True, exist_ok=True)
     snippet = _hook_snippet()
