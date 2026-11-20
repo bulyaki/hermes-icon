@@ -51,7 +51,7 @@ from hermes_icon.gui import start_gui_server
 from hermes_icon.presets import PRESET_ORDER, PRESETS, VIEWBOX, build_preset_svg
 from hermes_icon.renderer import IconRenderer, _load_generate_icons_module, apply_to_repo
 from hermes_icon.tui import LEFT_COL_WIDTH, render_tui_frame
-from hermes_icon.watcher import build_launchd_plist, git_hooks_status, is_launchd_loaded
+from hermes_icon.watcher import _launcher_bin, build_launchd_plist, git_hooks_status, is_launchd_loaded
 
 BIN_HERMES_ICON = Path(__file__).resolve().parent.parent / "bin" / "hermes-icon"
 
@@ -292,6 +292,25 @@ class TestLockAndWatcherConfig(unittest.TestCase):
         self.assertEqual(plist["Nice"], 0)
         self.assertEqual(plist["ThrottleInterval"], 5)
 
+    def test_version_flag_works_in_sandbox(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hermes-sandbox-home-") as tmp:
+            env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp}
+            for flag in ("--version", "-V"):
+                r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
+                self.assertEqual(r.returncode, 0)
+                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.0")
+
+    def test_homebrew_cellar_opt_resolution(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="hermes-brew-test-") as tmp:
+            prefix = Path(tmp)
+            cellar_bin = prefix / "Cellar" / "hermes-icon" / "0.1.0" / "libexec" / "bin"
+            cellar_bin.mkdir(parents=True)
+            (cellar_bin / "hermes-icon").write_text("#!/bin/sh\n", encoding="utf-8")
+            opt_bin = prefix / "opt" / "hermes-icon" / "bin"
+            opt_bin.mkdir(parents=True)
+            (opt_bin / "hermes-icon").write_text("#!/bin/sh\n", encoding="utf-8")
+            self.assertEqual(_launcher_bin(cellar_bin), opt_bin / "hermes-icon")
+
     def test_watcher_non_blocking_when_locked(self) -> None:
         with tempfile.TemporaryDirectory(prefix="hermes-lock-test-") as tmp:
             lock_p = Path(tmp) / "replacer.lock"
@@ -426,13 +445,15 @@ class TestLiveIntegrationAndSelfHealing(unittest.TestCase):
         self.assertIn("[ok]", up_res["check_stdout"])
 
         # 5. Simulated update restoration test:
-        # First verify non-blocking watcher skips if replacer.lock is currently held
+        # Age applied_at past 10s cooldown first so lock check is exercised deterministically
+        st = load_state()
+        st["applied_at"] = (datetime.now(timezone.utc) - timedelta(seconds=30)).isoformat()
+        save_state(st)
         with replacer_lock(blocking=True, mode="interactive"):
             skip_res = check_and_heal(apply_if_needed=True)
             self.assertEqual(skip_res["action"], "skipped_locked")
 
         # Verify cooldown skips if applied_at is <10s ago
-        st = load_state()
         st["applied_at"] = datetime.now(timezone.utc).isoformat()
         save_state(st)
         cool_res = check_and_heal(apply_if_needed=True)

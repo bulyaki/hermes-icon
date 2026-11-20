@@ -24,8 +24,18 @@ HOOK_BEGIN = "# BEGIN hermes-icon-replacer"
 HOOK_END = "# END hermes-icon-replacer"
 
 
-def _launcher_bin() -> Path:
-    return BIN_DIR / "hermes-icon"
+def _launcher_bin(bin_dir: Path | None = None) -> Path:
+    target_dir = bin_dir or BIN_DIR
+    parts = target_dir.parts
+    if "Cellar" in parts:
+        idx = parts.index("Cellar")
+        if idx + 1 < len(parts):
+            formula_name = parts[idx + 1]
+            prefix = Path(*parts[:idx])
+            opt_bin = prefix / "opt" / formula_name / "bin" / "hermes-icon"
+            if opt_bin.exists():
+                return opt_bin
+    return target_dir / "hermes-icon"
 
 
 def _hook_snippet() -> str:

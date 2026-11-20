@@ -199,7 +199,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="hermes-icon",
         description="Replace the Hermes app nous-girl icon across all surfaces.",
     )
-    parser.add_argument("--version", action="version", version=f"hermes-icon {__version__}")
+    parser.add_argument("-V", "--version", action="version", version=f"hermes-icon {__version__}")
 
     sub = parser.add_subparsers(dest="command")
 

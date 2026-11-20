@@ -1,7 +1,12 @@
 #!/bin/sh
 set -eu
 
-# Resolve symlinks to find the repository root dynamically
+if [ "${1:-}" = "--version" ] || [ "${1:-}" = "-V" ]; then
+    echo "hermes-icon 0.1.0"
+    exit 0
+fi
+
+# Resolve symlinks to find the repository or Homebrew libexec root dynamically
 SELF="$0"
 while [ -L "$SELF" ]; do
     DIR=$(cd -P "$(dirname "$SELF")" && pwd)
@@ -13,12 +18,15 @@ while [ -L "$SELF" ]; do
 done
 APP_ROOT=$(cd -P "$(dirname "$SELF")/.." && pwd)
 
-HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
-HERMES_INSTALLS="$HERMES_HOME/installs"
+USER_HOME="/Users/$(id -un)"
 
-resolve_python() {
+search_hermes_python() {
+    base_dir="$1"
+    installs_dir="$base_dir/installs"
+    [ -d "$installs_dir" ] || return 1
+
     # 1. Inspect $HERMES_HOME/installs/*/facts.json for packages.venv.environment
-    for facts in "$HERMES_INSTALLS"/*/facts.json; do
+    for facts in "$installs_dir"/*/facts.json; do
         [ -f "$facts" ] || continue
         env_dir=$(sed -n 's/.*"environment"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$facts" | head -n 1)
         if [ -n "$env_dir" ] && [ -x "$env_dir/bin/python" ]; then
@@ -28,7 +36,7 @@ resolve_python() {
     done
 
     # 2. Fallback: search $HERMES_HOME/installs/*/environments/*/venv/bin/python
-    for py in "$HERMES_INSTALLS"/*/environments/*/venv/bin/python; do
+    for py in "$installs_dir"/*/environments/*/venv/bin/python; do
         if [ -x "$py" ]; then
             printf '%s\n' "$py"
             return 0
@@ -38,9 +46,31 @@ resolve_python() {
     return 1
 }
 
+resolve_python() {
+    primary_home="${HERMES_HOME:-$HOME/.hermes}"
+    if search_hermes_python "$primary_home"; then
+        return 0
+    fi
+
+    fallback_home="$USER_HOME/.hermes"
+    if [ "$fallback_home" != "$primary_home" ] && search_hermes_python "$fallback_home"; then
+        return 0
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        sys_py=$(command -v python3)
+        if "$sys_py" -I -c "import PIL, resvg_py" >/dev/null 2>&1; then
+            printf '%s\n' "$sys_py"
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
 HERMES_PY=$(resolve_python || true)
 if [ -z "$HERMES_PY" ]; then
-    echo "hermes-icon: could not locate active Hermes Python interpreter under $HERMES_INSTALLS" >&2
+    echo "hermes-icon: could not locate active Hermes Python interpreter (with Pillow and resvg_py)" >&2
     exit 1
 fi
 

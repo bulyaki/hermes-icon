@@ -27,6 +27,21 @@ A macOS utility to customize the Hermes desktop application icon across every su
 
 ## Installation
 
+### Homebrew (Recommended)
+
+```bash
+brew install bulyaki/tap/hermes-icon
+```
+
+or:
+
+```bash
+brew tap bulyaki/tap
+brew install hermes-icon
+```
+
+### From Source
+
 ```sh
 git clone https://github.com/bulyaki/hermes-icon.git ~/Work/hermes-icon
 mkdir -p ~/.local/bin ~/.hermes/bin
