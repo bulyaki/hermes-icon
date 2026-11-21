@@ -401,17 +401,21 @@ class TestLockAndWatcherConfig(unittest.TestCase):
         self.assertEqual(plist["ThrottleInterval"], 5)
 
     def test_version_flag_works_in_sandbox(self) -> None:
+        from hermes_icon import __version__
+
         with tempfile.TemporaryDirectory(prefix="hermes-sandbox-home-") as tmp:
             env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": tmp}
             for flag in ("--version", "-V"):
                 r = subprocess.run([str(BIN_HERMES_ICON), flag], capture_output=True, text=True, env=env)
                 self.assertEqual(r.returncode, 0)
-                self.assertEqual(r.stdout.strip(), "hermes-icon 0.1.6")
+                self.assertEqual(r.stdout.strip(), f"hermes-icon {__version__}")
 
     def test_windows_task_scheduler_and_cmd_launcher(self) -> None:
+        from hermes_icon import __version__
+
         self.assertTrue(BIN_HERMES_ICON_CMD.is_file())
         cmd_text = BIN_HERMES_ICON_CMD.read_text(encoding="utf-8")
-        self.assertIn("hermes-icon 0.1.6", cmd_text)
+        self.assertIn(f"hermes-icon {__version__}", cmd_text)
         self.assertIn("run.py", cmd_text)
         self.assertIn("LOCALAPPDATA", cmd_text)
         self.assertIn("agent-payload", cmd_text)
@@ -1090,9 +1094,12 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             self.assertIn("Move-Item", copy_section)
             self.assertIn("Copy-Item", copy_section)
 
-            # Every icacls.exe invocation must pass /grant at most once (multiple /grant on one line fails with rc=87)
+            # Every icacls.exe invocation must pass /grant at most once (multiple /grant on one line fails with rc=87),
+            # and apply.ps1 must stay bounded (no per-file process storms inside $copies loop or WMI Get-CimInstance)
+            self.assertNotIn("Get-CimInstance", ps_script)
             icacls_lines = [ln.strip() for ln in ps_script.splitlines() if "icacls.exe" in ln]
             self.assertGreaterEqual(len(icacls_lines), 5)
+            self.assertLessEqual(len(icacls_lines), 10)
             for ln in icacls_lines:
                 self.assertEqual(ln.count("/grant"), 1, f"icacls line must have exactly one /grant: {ln}")
 

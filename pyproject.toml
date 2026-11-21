@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-icon"
-version = "0.1.7"
+version = "0.1.8"
 description = "Cross-platform utility to customize the Hermes desktop app icon and automatically persist it across updates"
 readme = "README.md"
 license = { text = "MIT" }

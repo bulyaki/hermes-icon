@@ -570,13 +570,14 @@ def _stop_windows_app_processes(win_app_dir: Path) -> list[str]:
     dir_str = str(win_app_dir).replace("'", "''")
     ps_script = (
         f"$dir = '{dir_str}'; "
-        "$procs = @(Get-CimInstance Win32_Process | Where-Object { "
-        "$_.ExecutablePath -and $_.ExecutablePath.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) "
-        f"-and $_.ProcessId -ne {os.getpid()} "
-        "-and $_.Name -notlike 'python*' "
+        "$procs = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { "
+        "$p = $null; try { $p = $_.Path } catch {}; "
+        "$p -and $p.StartsWith($dir, [System.StringComparison]::OrdinalIgnoreCase) "
+        f"-and $_.Id -ne {os.getpid()} "
+        "-and $_.ProcessName -notlike 'python*' "
         "}); "
-        "$exes = @($procs | Where-Object { $_.Name -like '*Hermes*' } | Select-Object -ExpandProperty ExecutablePath -Unique); "
-        "foreach ($p in $procs) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }; "
+        "$exes = @($procs | Where-Object { $_.ProcessName -like '*Hermes*' } | ForEach-Object { $_.Path } | Select-Object -Unique); "
+        "foreach ($p in $procs) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }; "
         "@($exes) | ConvertTo-Json -Compress"
     )
     relaunch_exes: list[str] = []
@@ -721,10 +722,11 @@ def _build_windows_acl_ps_script(
         f"$errLog = {_ps_quote(err_log_path)}",
         f"$appDir = {_ps_quote(win_app_dir)}",
         "try {",
-        "  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {",
-        "    $_.ExecutablePath -and $_.ExecutablePath.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase) -and $_.Name -notlike 'python*'",
+        "  Get-Process -ErrorAction SilentlyContinue | Where-Object {",
+        "    $p = $null; try { $p = $_.Path } catch {}",
+        "    $p -and $p.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase) -and $_.ProcessName -notlike 'python*'",
         "  } | ForEach-Object {",
-        "    Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue",
+        "    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue",
         "  }",
         "  $dirGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)F', '*S-1-15-2-1:(OI)(CI)RX', '*S-1-15-2-2:(OI)(CI)RX')",
         "  $fileGrants = @('*S-1-5-32-544:F', '*S-1-5-32-545:F', '*S-1-15-2-1:RX', '*S-1-15-2-2:RX')",
@@ -735,7 +737,7 @@ def _build_windows_acl_ps_script(
         "      foreach ($g in $dirGrants) {",
         "        & icacls.exe $d /grant $g /T /C /Q 2>$null | Out-Null",
         "      }",
-        "      Get-ChildItem -LiteralPath $d -File -ErrorAction SilentlyContinue | ForEach-Object { & attrib.exe -R -S -H $_.FullName 2>$null | Out-Null }",
+        "      & attrib.exe -R -S -H \"$d\\*\" 2>$null | Out-Null",
         "    }",
         "  }",
         f"  $dirs = @({dir_arr})",
@@ -771,11 +773,9 @@ def _build_windows_acl_ps_script(
                 "          New-Item -ItemType Directory -Force -Path $parent -ErrorAction Stop | Out-Null",
                 "        }",
                 "        if (Test-Path -LiteralPath $c.Dst) {",
-                "          & takeown.exe /F $c.Dst /A 2>$null | Out-Null",
-                "          foreach ($g in $fileGrants) {",
-                "            & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
-                "          }",
-                "          & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
+                "          try {",
+                "            [System.IO.File]::SetAttributes($c.Dst, [System.IO.FileAttributes]::Normal)",
+                "          } catch {}",
                 "          Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
                 "          if (Test-Path -LiteralPath $c.Dst) {",
                 "            $old = \"$($c.Dst).old\"",
@@ -785,11 +785,18 @@ def _build_windows_acl_ps_script(
                 "          }",
                 "        }",
                 "        Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
-                "        foreach ($g in $fileGrants) {",
-                "          & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
-                "        }",
                 "      } catch {",
-                "        $copyErrors += \"$($c.Dst): $($_.Exception.Message)\"",
+                "        try {",
+                "          & takeown.exe /F $c.Dst /A 2>$null | Out-Null",
+                "          foreach ($g in $fileGrants) {",
+                "            & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
+                "          }",
+                "          & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
+                "          Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
+                "          Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
+                "        } catch {",
+                "          $copyErrors += \"$($c.Dst): $($_.Exception.Message)\"",
+                "        }",
                 "      }",
                 "    }",
                 "  }",
@@ -817,7 +824,7 @@ def _run_windows_ps_script(
     *,
     script_dir: Path | None = None,
     err_log: Path | None = None,
-    timeout: float = 60.0,
+    timeout: float = 120.0,
 ) -> None:
     """Execute a PowerShell script directly if admin, or via a UAC-elevated PowerShell child."""
     tmp_dir: Path | None = None
