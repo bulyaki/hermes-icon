@@ -38,13 +38,16 @@ from .config import (
     REPLACER_ROOT,
     STAGED_REPO_DIR,
     IconConfig,
+    active_windows_app_dir,
     discover_windows_app_dirs,
     ensure_dirs,
+    is_windows_apps_protected_path,
     load_config,
     load_state,
     msix_assets_dir_for_win_app,
     save_config,
     save_state,
+    windows_app_redirect_dir,
     windows_app_surface_labels,
 )
 
@@ -352,7 +355,8 @@ def _tracked_surface_paths(
     win_labels = windows_app_surface_labels(resolved_win_dirs)
 
     for wdir in resolved_win_dirs:
-        wres = wdir / "resources"
+        active_wdir = active_windows_app_dir(wdir, replacer_root=REPLACER_ROOT)
+        wres = active_wdir / "resources"
         if not wres.is_dir():
             continue
         label = win_labels[wdir]
@@ -366,7 +370,7 @@ def _tracked_surface_paths(
         ):
             if path.exists():
                 surfaces[rel] = path
-        msix_assets = msix_assets_dir_for_win_app(wdir)
+        msix_assets = msix_assets_dir_for_win_app(active_wdir) or msix_assets_dir_for_win_app(wdir)
         if msix_assets is not None:
             for tile_name in ("Square44x44Logo.png", "Square150x150Logo.png"):
                 tile_p = msix_assets / tile_name
@@ -949,21 +953,224 @@ def _ensure_windows_writable(win_app_dir: Path) -> None:
         shutil.rmtree(work_dir, ignore_errors=True)
 
 
+def _create_windows_junction_or_copy(src_dir: Path, dst_dir: Path) -> None:
+    """Create a directory junction ``dst_dir -> src_dir`` on Windows (falling back to symlink/copy)."""
+    if dst_dir.exists() or dst_dir.is_symlink():
+        return
+    dst_dir.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform == "win32":
+        proc = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(dst_dir), str(src_dir)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0 and dst_dir.exists():
+            return
+    try:
+        os.symlink(src_dir, dst_dir, target_is_directory=True)
+    except OSError:
+        shutil.copytree(src_dir, dst_dir, dirs_exist_ok=True)
+
+
+def _prepare_windows_apps_redirect(
+    win_app_dir: Path,
+    *,
+    replacer_root: Path | None = None,
+) -> tuple[Path, Path | None]:
+    """Mirror a protected ``WindowsApps`` MSIX package into a user-writable redirect directory.
+
+    Windows 11's kernel filter driver (``AppxDeploymentServer`` / ``wcifs.sys``) blocks direct
+    file writes inside ``C:\\Program Files\\WindowsApps`` even from elevated ``BUILTIN\\Administrators``.
+    This mirrors the top-level Electron binaries (and creates a zero-copy directory junction for
+    ``resources\\agent-payload``) into ``~/.hermes/icon-replacer/msix-patched/<PkgId>/`` so we can
+    patch ``icon.ico``, ``app.asar``, ``assets/*.png``, and re-register ``AppxManifest.xml``
+    with ``Add-AppxPackage -Register`` without needing UAC elevation.
+    """
+    base_root = replacer_root if replacer_root is not None else REPLACER_ROOT
+    redirect_app_dir = windows_app_redirect_dir(win_app_dir, replacer_root=base_root)
+    is_app_subdir = win_app_dir.name.lower() == "app"
+    src_msix_root = win_app_dir.parent if is_app_subdir else win_app_dir
+    dst_msix_root = redirect_app_dir.parent if is_app_subdir else redirect_app_dir
+
+    src_manifest = src_msix_root / "AppxManifest.xml"
+    dst_manifest = dst_msix_root / "AppxManifest.xml"
+    version_marker = dst_msix_root / ".source-package.txt"
+    source_id = str(src_msix_root)
+    needs_sync = (
+        not redirect_app_dir.is_dir()
+        or not version_marker.is_file()
+        or version_marker.read_text(encoding="utf-8", errors="replace").strip() != source_id
+    )
+
+    dst_msix_root.mkdir(parents=True, exist_ok=True)
+    redirect_app_dir.mkdir(parents=True, exist_ok=True)
+
+    # Copy top-level MSIX root files (AppxManifest.xml, resources.pri, etc., skipping AppxSignature.p7x)
+    if src_msix_root != win_app_dir and src_msix_root.is_dir():
+        for item in src_msix_root.iterdir():
+            if item.name.lower() in ("app", "assets", "appxsignature.p7x", "appxmetadata"):
+                continue
+            dst_item = dst_msix_root / item.name
+            if item.is_file() and (needs_sync or not dst_item.exists()):
+                shutil.copy2(item, dst_item)
+
+    # Copy top-level Electron files/subdirs in win_app_dir (Hermes Agent.exe, *.dll, locales, etc.)
+    for item in win_app_dir.iterdir():
+        if item.name.lower() == "resources":
+            continue
+        dst_item = redirect_app_dir / item.name
+        if item.is_file():
+            if needs_sync or not dst_item.exists():
+                shutil.copy2(item, dst_item)
+        elif item.is_dir():
+            if needs_sync or not dst_item.exists():
+                shutil.copytree(item, dst_item, dirs_exist_ok=True)
+
+    # Set up resources/ with a directory junction for agent-payload (100,000+ files, zero copy)
+    src_res = win_app_dir / "resources"
+    dst_res = redirect_app_dir / "resources"
+    dst_res.mkdir(parents=True, exist_ok=True)
+    for item in src_res.iterdir():
+        dst_item = dst_res / item.name
+        if item.name.lower() == "agent-payload" and item.is_dir():
+            if needs_sync and (dst_item.exists() or dst_item.is_symlink()):
+                with contextlib.suppress(OSError):
+                    if dst_item.is_symlink() or sys.platform == "win32":
+                        os.rmdir(dst_item)
+                    else:
+                        shutil.rmtree(dst_item, ignore_errors=True)
+            _create_windows_junction_or_copy(item, dst_item)
+        elif item.name.lower() == "app.asar.unpacked" and item.is_dir():
+            for sub in item.iterdir():
+                dst_sub = dst_item / sub.name
+                if sub.name.lower() == "dist" and sub.is_dir():
+                    dst_sub.mkdir(parents=True, exist_ok=True)
+                    for dist_item in sub.iterdir():
+                        dst_dist_item = dst_sub / dist_item.name
+                        if dist_item.is_file():
+                            if needs_sync or not dst_dist_item.exists():
+                                shutil.copy2(dist_item, dst_dist_item)
+                        elif dist_item.is_dir():
+                            _create_windows_junction_or_copy(dist_item, dst_dist_item)
+                elif sub.is_dir():
+                    _create_windows_junction_or_copy(sub, dst_sub)
+                elif sub.is_file() and (needs_sync or not dst_sub.exists()):
+                    dst_sub.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(sub, dst_sub)
+        elif item.is_file():
+            if needs_sync or not dst_item.exists():
+                shutil.copy2(item, dst_item)
+        elif item.is_dir():
+            _create_windows_junction_or_copy(item, dst_item)
+
+    src_assets = msix_assets_dir_for_win_app(win_app_dir)
+    dst_assets: Path | None = None
+    if src_assets is not None:
+        dst_assets = (dst_msix_root / "assets") if src_assets == src_msix_root / "assets" else (redirect_app_dir / "assets")
+        dst_assets.mkdir(parents=True, exist_ok=True)
+        for item in src_assets.iterdir():
+            dst_item = dst_assets / item.name
+            if item.is_file() and (needs_sync or not dst_item.exists()):
+                shutil.copy2(item, dst_item)
+
+    if src_manifest.is_file():
+        shutil.copy2(src_manifest, dst_manifest)
+    version_marker.write_text(source_id + "\n", encoding="utf-8")
+    return redirect_app_dir, dst_assets
+
+
+def _register_redirected_windows_app(
+    redirect_app_dir: Path,
+    *,
+    source_win_app_dir: Path,
+) -> dict[str, Any]:
+    """Re-register the redirected MSIX ``AppxManifest.xml`` and update user shortcuts."""
+    is_app_subdir = redirect_app_dir.name.lower() == "app"
+    dst_msix_root = redirect_app_dir.parent if is_app_subdir else redirect_app_dir
+    manifest_path = dst_msix_root / "AppxManifest.xml"
+    exe_candidates = sorted(redirect_app_dir.glob("Hermes*.exe"))
+    exe_path = exe_candidates[0] if exe_candidates else (redirect_app_dir / "Hermes Agent.exe")
+    ico_path = redirect_app_dir / "resources" / "icon.ico"
+
+    appx_registered = False
+    if sys.platform == "win32" and manifest_path.is_file():
+        mf_q = _ps_quote(manifest_path)
+        reg_cmd = f"Add-AppxPackage -Register {mf_q} -DisableDevelopmentMode -ForceApplicationShutdown -ErrorAction Stop"
+        try:
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", reg_cmd],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            appx_registered = proc.returncode == 0
+        except Exception:
+            appx_registered = False
+
+    if sys.platform == "win32" and exe_path.is_file():
+        exe_q = _ps_quote(exe_path)
+        dir_q = _ps_quote(redirect_app_dir)
+        ico_q = _ps_quote(ico_path)
+        lnk_cmd = (
+            "$ws = New-Object -ComObject WScript.Shell; "
+            "$progDir = Join-Path $env:APPDATA 'Microsoft\\Windows\\Start Menu\\Programs'; "
+            "$deskDir = [Environment]::GetFolderPath('Desktop'); "
+            "$lnks = @(Join-Path $progDir 'Hermes Agent.lnk'); "
+            "foreach ($r in @($progDir, $deskDir)) { "
+            "  if ($r -and (Test-Path -LiteralPath $r)) { "
+            "    Get-ChildItem -LiteralPath $r -Filter '*Hermes*.lnk' -Recurse -ErrorAction SilentlyContinue | ForEach-Object { $lnks += $_.FullName } "
+            "  } "
+            "}; "
+            "foreach ($lp in ($lnks | Select-Object -Unique)) { "
+            "  try { "
+            "    $sc = $ws.CreateShortcut($lp); "
+            f"    $sc.TargetPath = {exe_q}; "
+            f"    $sc.WorkingDirectory = {dir_q}; "
+            f"    $sc.IconLocation = \"{ico_path},0\"; "
+            "    $sc.Save() "
+            "  } catch {} "
+            "}"
+        )
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", lnk_cmd],
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+    _ = source_win_app_dir
+    return {"appx_registered": appx_registered, "redirect_dir": str(redirect_app_dir)}
+
+
 def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
     """Patch a Windows Electron/MSIX directory (resources/icon.ico, app.asar, unpacked dist, MSIX tiles)."""
-    res_dir = win_app_dir / "resources"
-    if not res_dir.is_dir():
+    src_res_dir = win_app_dir / "resources"
+    if not src_res_dir.is_dir():
         return {"path": str(win_app_dir), "patched": False}
-
-    msix_assets = msix_assets_dir_for_win_app(win_app_dir)
-    desktop_assets = repo / "apps" / "desktop" / "assets"
-    desktop_public = repo / "apps" / "desktop" / "public"
-    unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
-    asar_path = res_dir / "app.asar"
 
     relaunch_exes: list[str] = []
     if sys.platform == "win32":
         relaunch_exes = _stop_windows_app_processes(win_app_dir)
+
+    target_app_dir = win_app_dir
+    redirect_meta: dict[str, Any] | None = None
+    if is_windows_apps_protected_path(win_app_dir):
+        target_app_dir, _ = _prepare_windows_apps_redirect(win_app_dir, replacer_root=REPLACER_ROOT)
+        if relaunch_exes:
+            redirect_exes = sorted(target_app_dir.glob("Hermes*.exe"))
+            if redirect_exes:
+                relaunch_exes = [str(redirect_exes[0])]
+
+    res_dir = target_app_dir / "resources"
+    msix_assets = msix_assets_dir_for_win_app(target_app_dir)
+    desktop_assets = repo / "apps" / "desktop" / "assets"
+    desktop_public = repo / "apps" / "desktop" / "public"
+    unpacked_dist = res_dir / "app.asar.unpacked" / "dist"
+    asar_path = res_dir / "app.asar"
 
     asar_res: dict[str, Any] | None = None
     msix_tiles_updated = 0
@@ -998,7 +1205,7 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
                 check_paths=list(replacements.keys()),
             )
             if not ok:
-                raise RuntimeError(f"Windows staged ASAR verification failed for {win_app_dir}: {errs}")
+                raise RuntimeError(f"Windows staged ASAR verification failed for {target_app_dir}: {errs}")
             copy_pairs.append((staged_asar, asar_path))
 
         if msix_assets is not None:
@@ -1008,7 +1215,10 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
                     copy_pairs.append((png_src, msix_assets / png_src.name))
                     msix_tiles_updated += 1
 
-        _apply_windows_copy_pairs(win_app_dir, copy_pairs, stage_dir=stage_dir)
+        _apply_windows_copy_pairs(target_app_dir, copy_pairs, stage_dir=stage_dir)
+
+        if target_app_dir != win_app_dir:
+            redirect_meta = _register_redirected_windows_app(target_app_dir, source_win_app_dir=win_app_dir)
 
         if asar_path.exists():
             ok, errs = verify_asar_integrity(
@@ -1018,7 +1228,7 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
                 check_paths=list(replacements.keys()),
             )
             if not ok:
-                raise RuntimeError(f"Windows ASAR verification failed after patching {win_app_dir}: {errs}")
+                raise RuntimeError(f"Windows ASAR verification failed after patching {target_app_dir}: {errs}")
     finally:
         shutil.rmtree(stage_dir, ignore_errors=True)
         if relaunch_exes:
@@ -1026,6 +1236,9 @@ def patch_windows_app_dir(win_app_dir: Path, repo: Path) -> dict[str, Any]:
 
     return {
         "path": str(win_app_dir),
+        "active_path": str(target_app_dir),
+        "redirected": target_app_dir != win_app_dir,
+        "redirect": redirect_meta,
         "patched": True,
         "asar": asar_res,
         "msix_assets_dir": str(msix_assets) if msix_assets is not None else None,
@@ -1248,12 +1461,19 @@ def _apply_icon_locked(
     win_ico = asset_root / "apps" / "desktop" / "assets" / "icon.ico"
     appx_manifests: list[Path] = []
     if win_dirs:
-        cand_ico = win_dirs[0] / "resources" / "icon.ico"
+        active_first = active_windows_app_dir(win_dirs[0], replacer_root=REPLACER_ROOT)
+        cand_ico = active_first / "resources" / "icon.ico"
         if cand_ico.exists():
             win_ico = cand_ico
         for wdir in win_dirs:
-            for mf in (wdir / "AppxManifest.xml", wdir.parent / "AppxManifest.xml"):
-                if mf.exists():
+            active_wdir = active_windows_app_dir(wdir, replacer_root=REPLACER_ROOT)
+            for mf in (
+                active_wdir / "AppxManifest.xml",
+                active_wdir.parent / "AppxManifest.xml",
+                wdir / "AppxManifest.xml",
+                wdir.parent / "AppxManifest.xml",
+            ):
+                if mf.exists() and mf not in appx_manifests:
                     appx_manifests.append(mf)
     if win_results or sys.platform == "win32":
         refresh_windows_icon_cache(win_ico, appx_manifest_paths=appx_manifests)

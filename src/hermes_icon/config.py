@@ -286,6 +286,39 @@ def _resolve_win_app_dir(cand: Path) -> Path | None:
     return None
 
 
+def is_windows_apps_protected_path(path: Path) -> bool:
+    """Return True if ``path`` resides inside ``C:\\Program Files\\WindowsApps``."""
+    norm = str(path).replace("/", "\\").lower()
+    return "\\windowsapps\\" in norm or norm.endswith("\\windowsapps")
+
+
+def windows_app_redirect_dir(
+    win_app_dir: Path,
+    *,
+    replacer_root: Path | None = None,
+) -> Path:
+    """Return the user-writable MSIX redirect directory for a ``WindowsApps`` package, or ``win_app_dir`` itself."""
+    if not is_windows_apps_protected_path(win_app_dir):
+        return win_app_dir
+    base = replacer_root if replacer_root is not None else REPLACER_ROOT
+    msix_root = win_app_dir.parent if win_app_dir.name.lower() == "app" else win_app_dir
+    pkg_id = msix_root.name.split("_")[0] or msix_root.name
+    rel_sub = win_app_dir.name if win_app_dir != msix_root else "app"
+    return base / "msix-patched" / pkg_id / rel_sub
+
+
+def active_windows_app_dir(
+    win_app_dir: Path,
+    *,
+    replacer_root: Path | None = None,
+) -> Path:
+    """Return the active patched directory (redirected copy if present, otherwise ``win_app_dir``)."""
+    redirect = windows_app_redirect_dir(win_app_dir, replacer_root=replacer_root)
+    if redirect != win_app_dir and (redirect / "resources" / "app.asar").exists():
+        return redirect
+    return win_app_dir
+
+
 def msix_assets_dir_for_win_app(win_app_dir: Path) -> Path | None:
     """Return the MSIX ``assets/`` directory containing Start/Taskbar tiles if present."""
     for cand in (win_app_dir / "assets", win_app_dir.parent / "assets"):

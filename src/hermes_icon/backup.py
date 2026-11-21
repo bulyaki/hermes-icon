@@ -21,9 +21,13 @@ from .config import (
     GENERATE_ICONS_PY,
     HERMES_APP,
     HERMES_REPO,
+    REPLACER_ROOT,
     WEB_DIST_FAVICON,
+    active_windows_app_dir,
     discover_windows_app_dirs,
+    is_windows_apps_protected_path,
     msix_assets_dir_for_win_app,
+    windows_app_redirect_dir,
     windows_app_surface_labels,
 )
 
@@ -207,6 +211,18 @@ def restore_original_icons(
                 (w for w in win_dirs if dst == w or w in dst.parents or (w.parent / "assets") in (dst, dst.parent)),
                 win_dirs[0] if win_dirs else dst.parent,
             )
+            if is_windows_apps_protected_path(dst):
+                redir_app = windows_app_redirect_dir(owner, replacer_root=REPLACER_ROOT)
+                src_msix = owner.parent if owner.name.lower() == "app" else owner
+                dst_msix = redir_app.parent if redir_app.name.lower() == "app" else redir_app
+                try:
+                    rel_to_msix = dst.relative_to(src_msix)
+                    redir_dst = dst_msix / rel_to_msix
+                    if redir_dst.parent.exists():
+                        dst = redir_dst
+                        owner = redir_app
+                except ValueError:
+                    pass
             win_pairs_by_dir.setdefault(owner, []).append((src, dst))
         else:
             other_pairs.append((src, dst))

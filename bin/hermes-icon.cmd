@@ -2,11 +2,11 @@
 setlocal enabledelayedexpansion
 
 if "%~1"=="--version" (
-  echo hermes-icon 0.1.10
+  echo hermes-icon 0.1.11
   exit /b 0
 )
 if "%~1"=="-V" (
-  echo hermes-icon 0.1.10
+  echo hermes-icon 0.1.11
   exit /b 0
 )
 

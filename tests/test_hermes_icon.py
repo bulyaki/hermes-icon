@@ -1141,14 +1141,21 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
                 self.assertTrue(probe_stage.is_dir())
                 self.assertEqual(probe_stage.parent, test_replacer_root / "tmp")
                 shutil.rmtree(probe_stage, ignore_errors=True)
-                patch_windows_app_dir(app_dir, fake_repo)
+                win_patch_res = patch_windows_app_dir(app_dir, fake_repo)
             finally:
                 applier_mod.patch_asar = orig_patch_asar
                 applier_mod.REPLACER_ROOT = orig_replacer_root
 
             self.assertEqual(len(patched_paths), 1)
             self.assertEqual(patched_paths[0].parent.parent, test_replacer_root / "tmp")
-            self.assertEqual((res_dir / "icon.ico").read_bytes(), b"NEW_ICO")
+            self.assertTrue(win_patch_res["redirected"])
+            redirect_app = Path(win_patch_res["active_path"])
+            self.assertEqual(
+                redirect_app,
+                test_replacer_root / "msix-patched" / "NousResearchInc.HermesAgent" / "app",
+            )
+            self.assertEqual((redirect_app / "resources" / "icon.ico").read_bytes(), b"NEW_ICO")
+            self.assertTrue((redirect_app / "resources" / "agent-payload").exists())
             self.assertFalse(list(res_dir.glob("*.tmp")))
 
 
