@@ -677,7 +677,10 @@ def _make_unvirtualized_stage_dir(prefix: str = "stage-") -> Path:
 def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[Path]]:
     """Return ``(recursive_dirs, non_recursive_dirs, target_files)`` for a Windows app dir.
 
-    Never returns ``resources/agent-payload`` or sets recursive flags on ``resources/``.
+    Never includes ancestor directories of ``resources/agent-payload`` (i.e. never
+    ``<InstallLocation>``, ``<InstallLocation>/app``, or ``<InstallLocation>/app/resources``)
+    because ``SetNamedSecurityInfoW`` (invoked by ``takeown`` and ``icacls``) re-evaluates
+    DACL inheritance across all descendants of any directory it modifies.
     """
     res_dir = win_app_dir / "resources"
     unpacked_dir = res_dir / "app.asar.unpacked"
@@ -685,10 +688,7 @@ def _windows_acl_scope(win_app_dir: Path) -> tuple[list[Path], list[Path], list[
     msix_assets = msix_assets_dir_for_win_app(win_app_dir)
 
     recursive_dirs = [msix_assets] if msix_assets is not None else []
-    non_recursive_dirs: list[Path] = []
-    if msix_assets is not None and msix_assets == win_app_dir.parent / "assets":
-        non_recursive_dirs.append(win_app_dir.parent)
-    non_recursive_dirs.extend([win_app_dir, res_dir, unpacked_dir, unpacked_dist])
+    non_recursive_dirs = [unpacked_dir, unpacked_dist]
     target_files = [
         res_dir / "icon.ico",
         res_dir / "app.asar",
@@ -786,15 +786,8 @@ def _build_windows_acl_ps_script(
                 "          try {",
                 "            [System.IO.File]::SetAttributes($c.Dst, [System.IO.FileAttributes]::Normal)",
                 "          } catch {}",
-                "          Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
-                "          if (Test-Path -LiteralPath $c.Dst) {",
-                "            $old = \"$($c.Dst).old\"",
-                "            Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
-                "            Move-Item -LiteralPath $c.Dst -Destination $old -Force -ErrorAction SilentlyContinue",
-                "            Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue",
-                "          }",
                 "        }",
-                "        Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
+                "        [System.IO.File]::Copy($c.Src, $c.Dst, $true)",
                 "      } catch {",
                 "        try {",
                 "          Write-Step \"fallback acl for $($c.Dst): $($_.Exception.Message)\"",
@@ -803,7 +796,6 @@ def _build_windows_acl_ps_script(
                 "            & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
                 "          }",
                 "          & attrib.exe -R -S -H $c.Dst 2>$null | Out-Null",
-                "          Remove-Item -LiteralPath $c.Dst -Force -ErrorAction SilentlyContinue",
                 "          Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
                 "        } catch {",
                 "          $copyErrors += \"$($c.Dst): $($_.Exception.Message)\"",

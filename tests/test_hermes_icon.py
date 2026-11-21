@@ -1054,13 +1054,16 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
                 user_home / ".hermes" / "icon-replacer",
             )
 
-            # 2. ACL scope and generated PowerShell script must never traverse agent-payload or resources recursively
+            # 2. ACL scope and generated PowerShell script must never traverse agent-payload or any ancestor of agent-payload
             rec_dirs, non_rec_dirs, files = _windows_acl_scope(app_dir)
             self.assertEqual(rec_dirs, [msix_assets])
             self.assertEqual(
                 non_rec_dirs,
-                [msix_root, app_dir, res_dir, res_dir / "app.asar.unpacked", unpacked_dist],
+                [res_dir / "app.asar.unpacked", unpacked_dist],
             )
+            self.assertNotIn(msix_root, non_rec_dirs)
+            self.assertNotIn(app_dir, non_rec_dirs)
+            self.assertNotIn(res_dir, non_rec_dirs)
             self.assertEqual(len(files), 5)
             self.assertTrue(all("agent-payload" not in str(p) for p in (*rec_dirs, *non_rec_dirs, *files)))
 
@@ -1077,12 +1080,15 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             file_section = ps_script.split("$files = @")[1].split("$copies = @")[0]
             copy_section = ps_script.split("$copies = @")[1]
 
-            # Recursive /R and /T appear ONLY in $recDirs (assets), never in $dirs (resources) or $files
+            # Recursive /R and /T appear ONLY in $recDirs (assets), never in $dirs or $files,
+            # and $dirs must NEVER contain msix_root, app_dir, or res_dir (ancestors of agent-payload)
             self.assertIn(str(msix_assets), rec_section)
             self.assertIn(" /R ", rec_section)
             self.assertIn(" /T ", rec_section)
-            self.assertIn(str(res_dir), dir_section)
-            self.assertIn(str(msix_root), dir_section)
+            self.assertIn(str(unpacked_dist), dir_section)
+            self.assertNotIn(f"'{res_dir}'", dir_section)
+            self.assertNotIn(f"'{app_dir}'", dir_section)
+            self.assertNotIn(f"'{msix_root}'", dir_section)
             self.assertNotIn(" /R ", dir_section)
             self.assertNotIn(" /T ", dir_section)
             self.assertNotIn("(OI)(CI)", dir_section)
@@ -1091,8 +1097,7 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             self.assertNotIn("(OI)(CI)", file_section)
             self.assertIn("*S-1-5-32-545:F", ps_script)
             self.assertIn("attrib.exe -R", file_section)
-            self.assertIn("Remove-Item", copy_section)
-            self.assertIn("Move-Item", copy_section)
+            self.assertIn("[System.IO.File]::Copy", copy_section)
             self.assertIn("Copy-Item", copy_section)
 
             # Every icacls.exe invocation must pass /grant at most once (multiple /grant on one line fails with rc=87),
