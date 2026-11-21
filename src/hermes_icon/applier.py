@@ -721,20 +721,27 @@ def _build_windows_acl_ps_script(
         "$ErrorActionPreference = 'Continue'",
         f"$errLog = {_ps_quote(err_log_path)}",
         f"$appDir = {_ps_quote(win_app_dir)}",
+        "function Write-Step([string]$msg) {",
+        "  try { Add-Content -LiteralPath $errLog -Value \"[$([DateTime]::UtcNow.ToString('HH:mm:ss.fff'))] $msg\" -Encoding UTF8 -ErrorAction SilentlyContinue } catch {}",
+        "}",
         "try {",
-        "  Get-Process -ErrorAction SilentlyContinue | Where-Object {",
+        "  Write-Step 'start'",
+        "  Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.ProcessName -like '*Hermes*' } | ForEach-Object {",
         "    $p = $null; try { $p = $_.Path } catch {}",
-        "    $p -and $p.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase) -and $_.ProcessName -notlike 'python*'",
-        "  } | ForEach-Object {",
-        "    Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue",
+        "    if (-not $p -or $p.StartsWith($appDir, [System.StringComparison]::OrdinalIgnoreCase)) {",
+        "      Write-Step \"stopping pid=$($_.Id) name=$($_.ProcessName)\"",
+        "      Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue",
+        "    }",
         "  }",
-        "  $dirGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)F', '*S-1-15-2-1:(OI)(CI)RX', '*S-1-15-2-2:(OI)(CI)RX')",
+        "  $dirGrants = @('*S-1-5-32-544:F', '*S-1-5-32-545:F', '*S-1-15-2-1:RX', '*S-1-15-2-2:RX')",
+        "  $inheritGrants = @('*S-1-5-32-544:(OI)(CI)F', '*S-1-5-32-545:(OI)(CI)F', '*S-1-15-2-1:(OI)(CI)RX', '*S-1-15-2-2:(OI)(CI)RX')",
         "  $fileGrants = @('*S-1-5-32-544:F', '*S-1-5-32-545:F', '*S-1-15-2-1:RX', '*S-1-15-2-2:RX')",
         f"  $recDirs = @({rec_arr})",
         "  foreach ($d in $recDirs) {",
         "    if ($d -and (Test-Path -LiteralPath $d)) {",
+        "      Write-Step \"recDir $d\"",
         "      & takeown.exe /F $d /A /R /D Y 2>$null | Out-Null",
-        "      foreach ($g in $dirGrants) {",
+        "      foreach ($g in $inheritGrants) {",
         "        & icacls.exe $d /grant $g /T /C /Q 2>$null | Out-Null",
         "      }",
         "      & attrib.exe -R -S -H \"$d\\*\" 2>$null | Out-Null",
@@ -743,6 +750,7 @@ def _build_windows_acl_ps_script(
         f"  $dirs = @({dir_arr})",
         "  foreach ($d in $dirs) {",
         "    if ($d -and (Test-Path -LiteralPath $d)) {",
+        "      Write-Step \"dir $d\"",
         "      & takeown.exe /F $d /A 2>$null | Out-Null",
         "      foreach ($g in $dirGrants) {",
         "        & icacls.exe $d /grant $g /C /Q 2>$null | Out-Null",
@@ -752,6 +760,7 @@ def _build_windows_acl_ps_script(
         f"  $files = @({file_arr})",
         "  foreach ($f in $files) {",
         "    if ($f -and (Test-Path -LiteralPath $f)) {",
+        "      Write-Step \"file $f\"",
         "      & takeown.exe /F $f /A 2>$null | Out-Null",
         "      foreach ($g in $fileGrants) {",
         "        & icacls.exe $f /grant $g /C /Q 2>$null | Out-Null",
@@ -764,6 +773,7 @@ def _build_windows_acl_ps_script(
         lines.extend(
             [
                 f"  $copies = @({copy_entries})",
+                "  Write-Step \"copying $($copies.Count) files\"",
                 "  $copyErrors = @()",
                 "  foreach ($c in $copies) {",
                 "    if (Test-Path -LiteralPath $c.Src) {",
@@ -787,6 +797,7 @@ def _build_windows_acl_ps_script(
                 "        Copy-Item -LiteralPath $c.Src -Destination $c.Dst -Force -ErrorAction Stop",
                 "      } catch {",
                 "        try {",
+                "          Write-Step \"fallback acl for $($c.Dst): $($_.Exception.Message)\"",
                 "          & takeown.exe /F $c.Dst /A 2>$null | Out-Null",
                 "          foreach ($g in $fileGrants) {",
                 "            & icacls.exe $c.Dst /grant $g /C /Q 2>$null | Out-Null",
@@ -803,12 +814,13 @@ def _build_windows_acl_ps_script(
                 "  if ($copyErrors.Count -gt 0) {",
                 "    throw ($copyErrors -join \"`n\")",
                 "  }",
+                "  Write-Step 'done'",
             ]
         )
     lines.extend(
         [
             "} catch {",
-            "  ($_ | Out-String) | Set-Content -LiteralPath $errLog -Encoding UTF8",
+            "  Write-Step ('ERROR: ' + ($_ | Out-String))",
             "  & icacls.exe $errLog /grant '*S-1-5-32-545:F' /C /Q 2>$null | Out-Null",
             "  & icacls.exe $errLog /grant '*S-1-15-2-1:R' /C /Q 2>$null | Out-Null",
             "  & icacls.exe $errLog /grant '*S-1-15-2-2:R' /C /Q 2>$null | Out-Null",
@@ -858,13 +870,17 @@ def _run_windows_ps_script(
             is_admin = bool(ctypes.windll.shell32.IsUserAnAdmin())  # type: ignore[attr-defined]
 
         if is_admin:
-            proc = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(ps1_path)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                trace = _read_err_log()
+                raise RuntimeError(f"Elevated Windows ACL/copy script timed out after {timeout}s. Progress log:\n{trace}") from exc
             if proc.returncode != 0:
                 err_detail = _read_err_log()
                 detail = err_detail or (proc.stderr or proc.stdout).strip()
@@ -876,13 +892,17 @@ def _run_windows_ps_script(
                 f"-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File',{ps1_q}; "
                 "exit $p.ExitCode"
             )
-            proc = subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", elev_cmd],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
+            try:
+                proc = subprocess.run(
+                    ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", elev_cmd],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
+            except subprocess.TimeoutExpired as exc:
+                trace = _read_err_log()
+                raise RuntimeError(f"Elevated Windows ACL/copy script timed out after {timeout}s. Progress log:\n{trace}") from exc
             if proc.returncode != 0:
                 err_detail = _read_err_log()
                 detail = err_detail or (proc.stderr or proc.stdout).strip()

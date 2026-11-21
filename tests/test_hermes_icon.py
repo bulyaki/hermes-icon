@@ -1085,6 +1085,7 @@ class TestWindowsDiscoveryAndBootstrap(unittest.TestCase):
             self.assertIn(str(msix_root), dir_section)
             self.assertNotIn(" /R ", dir_section)
             self.assertNotIn(" /T ", dir_section)
+            self.assertNotIn("(OI)(CI)", dir_section)
             self.assertNotIn(" /R ", file_section)
             self.assertNotIn(" /T ", file_section)
             self.assertNotIn("(OI)(CI)", file_section)
